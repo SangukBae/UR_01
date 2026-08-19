@@ -81,6 +81,29 @@ Response shape:
 }
 ```
 
+## WSL2: attach a USB webcam first
+
+Skip this if you're not on WSL2, or if `ls /dev/video*` already shows a
+device. Otherwise, the camera needs `usbipd-win` to pass it through from
+Windows before OpenCV can see it (`can't open camera by index` / `Camera
+index out of range` means this step hasn't been done yet).
+
+```powershell
+# Windows PowerShell, as Administrator:
+usbipd list                            # find the webcam's BUSID
+usbipd bind --busid <BUSID>            # one-time per device
+usbipd attach --wsl --busid <BUSID>    # needed again after every reboot/sleep
+```
+
+```bash
+# Back in WSL2:
+ls /dev/video*   # should now show at least /dev/video0
+```
+
+If the camera never shows up in `usbipd list` at all, it's likely a
+built-in MIPI CSI camera, not USB — `usbipd` can't pass those through;
+run this outside WSL2/Docker on native Windows Python instead.
+
 ## Running it
 
 ```bash
