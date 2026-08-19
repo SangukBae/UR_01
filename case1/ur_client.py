@@ -347,6 +347,19 @@ class URClient:
             prev = wp
         return total
 
+    # --- Emergency stop --------------------------------------------------- #
+    def stop(self, deceleration: float = 2.0) -> RobotState:
+        """Immediately stop any motion in progress. Uploading a new program
+        preempts whatever's currently running on the controller -- same
+        mechanism every other method here uses to start a move, just with
+        ``stopj`` instead. No RUNNING check: stopping should never itself be
+        blocked by the state it's meant to get the robot out of."""
+        script = f"def stop_now():\n  stopj({deceleration:.4f})\nend\n"
+        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
+            s.sendall(script.encode())
+        time.sleep(0.3)  # let the stop take effect before reporting state
+        return self.get_state()
+
     # --- Tool IO ---------------------------------------------------------- #
     def set_gripper(self, closed: bool) -> RobotState:
         """Set tool digital output 0 (the convention this rig's gripper is

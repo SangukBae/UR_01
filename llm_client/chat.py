@@ -54,6 +54,16 @@ SYSTEM_PROMPT = (
     "wrong -- and either fix the call or tell the user what went wrong."
 )
 
+# Team requirement: minimal spoken feedback, not a screen of text read
+# aloud. Only used for --voice; text mode keeps the fuller SYSTEM_PROMPT
+# above since there's no reason to shorten what's already just printed.
+VOICE_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    " The user is listening, not reading -- your reply is spoken aloud, not "
+    "shown as text. Keep it to a few words: 'Yes.', 'Done.', 'There was an "
+    "issue.', 'Cannot execute -- unsafe speed.' No lists, no markdown, no "
+    "reciting numbers back unless the user asked a question that needs one."
+)
+
 
 def _to_openai_tools(mcp_tools) -> list[dict]:
     """MCP tool list -> OpenAI chat-completions ``tools`` schema."""
@@ -70,12 +80,19 @@ def _to_openai_tools(mcp_tools) -> list[dict]:
     ]
 
 
-async def main(get_input: Callable[[], str | None], hint: str) -> None:
+async def main(
+    get_input: Callable[[], str | None],
+    hint: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    speak: Callable[[str], None] | None = None,
+) -> None:
     """``get_input`` returns the next user message (or None/empty to skip a
     turn, e.g. voice mode hearing nothing) -- ``input("You: ")`` for typed
     chat, ``voice.listen()`` for ``--voice``. Everything past that point
     (the LLM + tool-call loop) doesn't care which one produced the text.
     ``hint`` is just the startup line telling you which one is active.
+    ``speak``, if given, is called with the final reply text each turn
+    (``--voice`` passes ``tts.speak``; text mode leaves it None).
     """
     api_key = os.environ.get(API_KEY_ENV)
     if not api_key:
@@ -114,7 +131,7 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
         print(f"Connected: {len(tools)} tools from ur-tools, model {MODEL} @ {BASE_URL}")
         print(f"{hint} Ctrl-C to quit.\n")
 
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
         while True:
             try:
                 user_text = get_input()
@@ -143,6 +160,8 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
 
                 if not message.tool_calls:
                     print("Robot:", message.content)
+                    if speak is not None:
+                        speak(message.content or "")
                     break
 
                 for call in message.tool_calls:
@@ -160,6 +179,8 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
             else:
                 print(f"Robot: (stopped after {MAX_TOOL_ROUNDS} tool-call rounds "
                       "without a final answer -- it may be stuck; try rephrasing)")
+                if speak is not None:
+                    speak("There was an issue.")
 
 
 def _text_input() -> str | None:
@@ -185,6 +206,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     if args.voice:
-        asyncio.run(main(_voice_input, "Speaking mode -- each turn, just start talking."))
+        import tts  # local import: only needed for --voice
+        asyncio.run(main(
+            _voice_input, "Speaking mode -- each turn, just start talking.",
+            system_prompt=VOICE_SYSTEM_PROMPT, speak=tts.speak,
+        ))
     else:
         asyncio.run(main(_text_input, "Type a message (e.g. 'move the robot home')."))

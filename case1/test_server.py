@@ -39,7 +39,7 @@ async def main() -> None:
         assert set(names) == {
             "move_robot_to_position", "example",
             "get_robot_state", "move_robot_linear", "move_through_waypoints",
-            "move_robot_to_position_safe", "set_gripper",
+            "move_robot_to_position_safe", "set_gripper", "stop_robot",
         }, names
         print("tools:", names)
 
@@ -166,6 +166,17 @@ async def main() -> None:
             print("bad gripper state rejected:", str(exc).splitlines()[-1].strip())
         else:
             raise AssertionError("bad gripper state was accepted")
+
+        # stop_robot: smoke test only -- calling it with nothing moving is a
+        # harmless no-op (the socket backend's stopj lands on an already
+        # stationary robot). Interrupting a real in-flight move needs two
+        # concurrent connections (this client blocks on each call it awaits),
+        # which was verified separately: two processes, one moving the robot
+        # slowly, the other calling stop_robot mid-motion -- the robot
+        # stopped exactly where it was and never reached the target.
+        stopped = await client.call_tool("stop_robot", {})
+        assert stopped.data["status"] == "stopped"
+        print("stop_robot:", stopped.data["joints_deg"])
 
         await client.call_tool("move_robot_to_position", {})  # park home
     print("ALL PASSED")

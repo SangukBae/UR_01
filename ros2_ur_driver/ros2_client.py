@@ -118,6 +118,7 @@ class ROS2URClient:
         self._robot_mode: int | None = None
         self._safety_mode: int | None = None
         self._io_states: IOStates | None = None
+        self._active_goal_handle = None  # set while a trajectory goal is in flight
 
     # --- Lifecycle -------------------------------------------------------- #
     def connect(self, timeout_s: float = 10.0) -> None:
@@ -320,14 +321,20 @@ class ROS2URClient:
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Trajectory goal was rejected by the controller.")
 
-        result_future = goal_handle.get_result_async()
-        self._wait(result_future, deadline)
-        wrapped = result_future.result()
+        self._active_goal_handle = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait(result_future, deadline)
+            wrapped = result_future.result()
+        finally:
+            self._active_goal_handle = None
         if wrapped is None:
             raise TimeoutError(
                 f"Robot did not reach the target within {timeout_s:.0f}s "
                 "(still moving, blocked, or a protective stop?)."
             )
+        if wrapped.status == GoalStatus.STATUS_CANCELED:
+            return self.get_state()
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED or wrapped.result.error_code != 0:
             raise RuntimeError(
                 f"Trajectory failed: status={wrapped.status} "
@@ -424,25 +431,31 @@ class ROS2URClient:
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Trajectory goal was rejected by the controller.")
 
-        result_future = goal_handle.get_result_async()
-        target = waypoints[-1]
-        trace: list[RobotState] = []
-        last_poll = 0.0
-        while not result_future.done():
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"Robot did not reach the last waypoint within {timeout_s:.0f}s "
-                    "(still moving, blocked, or a protective stop?)."
-                )
-            if time.monotonic() - last_poll >= trace_interval_s:
-                state = self.get_state()
-                trace.append(state)
-                last_poll = time.monotonic()
-                if on_state is not None:
-                    on_state(state)
-            time.sleep(0.05)
+        self._active_goal_handle = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            target = waypoints[-1]
+            trace: list[RobotState] = []
+            last_poll = 0.0
+            while not result_future.done():
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Robot did not reach the last waypoint within {timeout_s:.0f}s "
+                        "(still moving, blocked, or a protective stop?)."
+                    )
+                if time.monotonic() - last_poll >= trace_interval_s:
+                    state = self.get_state()
+                    trace.append(state)
+                    last_poll = time.monotonic()
+                    if on_state is not None:
+                        on_state(state)
+                time.sleep(0.05)
+            wrapped = result_future.result()
+        finally:
+            self._active_goal_handle = None
 
-        wrapped = result_future.result()
+        if wrapped.status == GoalStatus.STATUS_CANCELED:
+            return self.get_state(), trace
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED or wrapped.result.error_code != 0:
             raise RuntimeError(
                 f"Trajectory failed: status={wrapped.status} "
@@ -457,6 +470,20 @@ class ROS2URClient:
                 f"{max(abs(a - b) for a, b in zip(final.q_rad, target)):.4f} rad off target."
             )
         return final, trace
+
+    # --- Emergency stop --------------------------------------------------- #
+    def stop(self) -> RobotState:
+        """Cancel the active trajectory goal, if any (best-effort: if
+        nothing is moving, this is a no-op). Unlike the socket backend
+        (a fresh program upload always preempts), a ROS2 goal can only be
+        cancelled if move_joint/move_waypoints is still tracking it as
+        active -- there's no separate out-of-band stop channel here."""
+        handle = self._active_goal_handle
+        if handle is not None:
+            cancel_future = handle.cancel_goal_async()
+            self._wait(cancel_future, time.monotonic() + 2.0)
+        time.sleep(0.3)
+        return self.get_state()
 
     # --- Tool IO -------------------------------------------------------- #
     def set_gripper(self, closed: bool) -> RobotState:

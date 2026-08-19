@@ -11,7 +11,7 @@ backends).
 
 | File | Role |
 |------|------|
-| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `example` (template) |
+| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `example` (template) |
 | `ur_client.py` | socket seam over the robot (motion + state), `UR_BACKEND=socket` (default) |
 | `kinematics.py` | nominal UR10 forward kinematics, used only for the Diamond workspace-bounds safety check |
 | `test_server.py` | in-process smoke test for every tool above |
@@ -103,7 +103,7 @@ claude mcp list
 ```
 
 GUI clients (Bionic, OpenClaw, Cursor, Claude Desktop): MCP entry, command
-`python3`, arg the absolute path to `server.py` (7 tools on probe). Course
+`python3`, arg the absolute path to `server.py` (8 tools on probe). Course
 guides for Bionic/OpenClaw:
 [`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md),
 [`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)
@@ -165,9 +165,12 @@ minimal template; copy it to start each new tool.
 
 Two interchangeable seams live behind the same `RobotState` shape and method
 names (`connect`, `get_state`, `move_joint`, `move_linear`, `move_waypoints`,
-`set_gripper`); `server.py`'s tools call whichever one `UR_BACKEND` picked and
-don't otherwise care which it is -- except `move_linear`, which the ROS2 seam
-implements only as a `NotImplementedError` (see Tiers above).
+`set_gripper`, `stop`); `server.py`'s tools call whichever one `UR_BACKEND`
+picked and don't otherwise care which it is -- except `move_linear`, which
+the ROS2 seam implements only as a `NotImplementedError` (see Tiers above),
+and `stop`, which on the ROS2 seam only cancels a goal that `move_joint`/
+`move_waypoints` is still tracking as active in the same process (the
+socket seam's `stop` always works -- any upload preempts the controller).
 
 - **`ur_client.py`** (`UR_BACKEND=socket`, default) -- plain TCP sockets, no
   ROS2:

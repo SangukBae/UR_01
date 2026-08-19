@@ -5,6 +5,7 @@ fastmcp>=2.0
 
 # --voice only: microphone capture (numpy, for the energy-based VAD) and
 # local speech-to-text (faster-whisper, CPU, no API key). Also needs
-# pulseaudio-utils installed system-side (`parec`) -- see voice.py.
+# pulseaudio-utils installed system-side (`parec`) -- see voice.py -- and
+# espeak-ng system-side for spoken replies (`paplay`, via tts.py).
 numpy>=1.24
 faster-whisper>=1.0

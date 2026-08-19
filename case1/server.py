@@ -27,6 +27,10 @@ Tools, by tier:
     digital IO.
   * ``example`` -- a do-nothing template showing the minimal tool shape. Copy
     it to start a new tool of your own.
+  * ``stop_robot`` -- team requirement, not part of the four tiers:
+    immediately halt any motion in progress. Socket backend always works
+    (a fresh upload preempts); ROS2 backend only if a move is still
+    in-flight in the same process (see ros2_client.py's ``stop``).
 
 Return JSON-serializable dicts with explicit units in the key names.
 """
@@ -435,6 +439,46 @@ def set_gripper(state: str) -> dict:
                        for n, q in zip(JOINT_NAMES, result.q_rad)},
         "tcp_pose": [round(v, 4) for v in result.tcp_pose],
         "robot_mode": result.robot_mode,
+    }
+
+
+# =========================================================================== #
+# EMERGENCY STOP  --  team requirement, not one of the four tiers: halt any
+# motion in progress right now, not the next command in a queue.
+# =========================================================================== #
+@mcp.tool
+def stop_robot() -> dict:
+    """Immediately halt any motion in progress.
+
+    Call this the moment a motion looks wrong or was a mistake. On the
+    socket backend this always works, because sending anything to the
+    controller preempts whatever it's currently running -- same mechanism
+    every move tool uses to start motion, just with a stop command instead.
+    On the ROS2 backend this can only cancel a trajectory goal that is
+    still tracked as active by the move call that started it, in this same
+    process -- a stop issued after that call has already returned has
+    nothing to cancel.
+
+    Note: within one chat turn, tool calls run one at a time -- calling
+    this from the same conversation that is still waiting on a move to
+    finish won't interrupt that move, because this call can't start until
+    the earlier one returns. It's here to be called between turns, or from
+    a second, concurrent client.
+
+    Returns:
+        A dict with ``status``, the robot's ``joints_deg``/``tcp_pose``/
+        ``robot_mode``/``safety_status`` right after the stop.
+    """
+    # 1-3. No inputs to validate or units to convert -- stop takes none.
+    # 4. Execute, then report the resulting state.
+    state = robot.stop()
+    return {
+        "status": "stopped",
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+        "safety_status": state.safety_status,
     }
 
 

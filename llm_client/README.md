@@ -3,7 +3,8 @@
 Standalone chat wrapper (no GUI app, unlike the course's `llm-client/`
 Bionic/OpenClaw guides): natural language in, LLM picks a `case1/server.py`
 tool, robot moves. Reimplements the team's Bronze "LLM wrapper" (Nina,
-Cerebras) against this repo's own server (all four tiers, not just Bronze).
+Cerebras) against this repo's own server (all four tiers, not just Bronze,
+plus `stop_robot` -- say "Stop" and it halts in-progress motion).
 
 ## Setup
 
@@ -25,7 +26,7 @@ python3 chat.py
 ```
 
 ```
-Connected: 7 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
+Connected: 8 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
 Type a message (e.g. 'move the robot home'). Ctrl-C to quit.
 
 You: move the robot home
@@ -46,14 +47,21 @@ records until you stop, transcribes locally (no API key), prints what it
 heard (STT can mishear), sends it same as typed input:
 
 ```
-Connected: 7 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
+Connected: 8 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
 Speaking mode -- each turn, just start talking. Ctrl-C to quit.
 
 🎤 Listening -- speak your command...
 You (heard): move the robot home
   -> move_robot_to_position({})
-Robot: Done -- the robot is now at its home position...
+Robot: Done.
 ```
+
+Voice mode replies are kept short -- a separate, terser system prompt
+("Yes.", "Done.", "There was an issue.") -- and spoken aloud through
+`tts.py` (`espeak-ng` -> `paplay`, the same PulseAudio bridge as the mic).
+Bare interjections ("um", "uh"...) are dropped before ever reaching the
+LLM (`voice._is_filler`); a real short command ("Stop") is never at risk,
+only an utterance that's *exactly* one filler word gets swallowed.
 
 **Verified live** over WSL2/WSLg's PulseAudio mic bridge (`RDPSource`,
 `$PULSE_SERVER` already set, no config needed) -- "move the robot home"
@@ -62,8 +70,8 @@ correctly. Works on any Linux with a PulseAudio default source; never
 hardcodes `RDPSource`.
 
 ```bash
-sudo apt install -y pulseaudio-utils   # parec, not parecord -- see voice.py
-pactl list short sources               # confirm a real default source
+sudo apt install -y pulseaudio-utils espeak-ng   # parec (input) + espeak-ng (output)
+pactl list short sources                          # confirm a real default source
 ```
 
 No wake word -- armed on each `listen()` call, triggers on energy
@@ -73,6 +81,13 @@ sensitivity; `VOICE_DEBUG=1` to watch live RMS), `VOICE_SILENCE_HANG_S`
 (give-up caps), `WHISPER_MODEL` (`base.en` default; `small.en` more
 accurate). Stray noise can hallucinate a phrase (Whisper quirk) -- raise
 `VOICE_START_RMS` if that's frequent.
+
+**Known gap: not listening while a move is in progress.** Each turn blocks
+until its tool call returns, so saying "Stop" *while* the robot is mid-motion
+doesn't reach it -- the mic isn't even recording at that moment (`stop_robot`
+exists and works, see `case1/server.py`, but only between turns or from a
+second concurrent client). Fixing this needs running tool execution and
+listening concurrently, not built here.
 
 ## Other endpoints
 

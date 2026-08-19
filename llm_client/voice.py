@@ -156,15 +156,34 @@ def transcribe(raw_audio: bytes) -> str | None:
     return text or None
 
 
+# Bare interjections to drop before they ever reach the LLM (team
+# requirement: ignore non-command chatter). Deliberately narrow -- this
+# only fires when the ENTIRE utterance is exactly one of these words, so a
+# real short command ("Stop", "Wait", "Go") is never at risk of being
+# swallowed by it.
+_FILLER_WORDS = {
+    "uh", "um", "umm", "uhh", "hmm", "hm", "mm", "mhm", "ah", "eh", "huh", "oh",
+}
+
+
+def _is_filler(text: str) -> bool:
+    words = text.strip().lower().rstrip(".!?,").split()
+    return len(words) == 1 and words[0] in _FILLER_WORDS
+
+
 def listen(prompt: str = "Listening... speak now.") -> str | None:
     """Record one spoken command from the microphone and transcribe it.
     Prints ``prompt``, then waits for you to start talking and records
-    until you stop. Returns None if nothing was heard within MAX_WAIT_S, or
-    nothing intelligible was transcribed."""
+    until you stop. Returns None if nothing was heard within MAX_WAIT_S,
+    nothing intelligible was transcribed, or the whole utterance was a bare
+    filler word ("um", "uh", ...) -- see ``_is_filler``."""
     print(prompt)
     audio = _collect_utterance(_mic_chunks())
     if DEBUG:
         print()
     if audio is None:
         return None
-    return transcribe(audio)
+    text = transcribe(audio)
+    if text is not None and _is_filler(text):
+        return None
+    return text
