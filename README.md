@@ -1,13 +1,14 @@
 # UR_01 — UR10 Robotics Summer School: Case 1 + ROS2 Driver Integration
 
 Work from the UR Robotics Summer School 2026 (Universal Robots UR10, PolyScope X
-simulator): the Case 1 MCP server baseline plus a working ROS2 ↔ UR10
-integration verified end-to-end (state read + real motion) against the
-simulator.
+simulator): the Case 1 MCP server (Bronze → Diamond tiers, all implemented and
+verified) plus a working ROS2 ↔ UR10 integration verified end-to-end (state
+read + real motion) against the simulator.
 
 - [`case1/`](case1/) — MCP server exposing UR10 tools to an LLM
-  (`server.py`, `ur_client.py`, `test_server.py`). See its own
-  [README](case1/README.md) for the tier ladder (Bronze → Diamond).
+  (`server.py`, `ur_client.py`, `kinematics.py`, `test_server.py`), with an
+  interchangeable ROS2 backend (`../ros2_ur_driver/ros2_client.py`). See its
+  own [README](case1/README.md) for the tier ladder (Bronze → Diamond).
 - [`ros2_ur_driver/`](ros2_ur_driver/) — `ros-humble-ur-robot-driver`
   connected to the simulator, with the two blockers that stop the robot
   from moving and how to get past them.
@@ -151,5 +152,7 @@ claude mcp list
 ```
 
 See [`case1/README.md`](case1/README.md) for the Bronze → Diamond tiers.
-Only Bronze (baseline `move_robot_to_position` tool) is verified working
-here; Silver+ (state/motion/gripper tools) are not yet implemented.
+**Status: all four tiers implemented and verified** against the PolyScope X
+simulator — `move_robot_to_position` (Bronze), `get_robot_state` (Silver),
+`move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper`
+(Diamond). `test_server.py` passes end to end (`ALL PASSED`).
