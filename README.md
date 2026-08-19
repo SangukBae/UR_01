@@ -46,14 +46,23 @@ docker ps                     # confirm essre-ursim-psx is Up
 Open `http://localhost` in a browser:
 
 1. Power the robot on and release the brakes until it reads **RUNNING**.
-2. Go to **Settings → Password** and unlock:
-   - **Admin** (default password `easybot`) — you'll be forced to set a new
-     one (8+ chars) on first use.
-   - **Operational Mode** (default password `operator`) — set it to
-     **Automatic**.
-3. Switch **Remote Control** from `Local` to `Remote`.
-   (Without this, the robot accepts motion commands but silently never
-   moves — no error anywhere.)
+2. (Optional) Go to **Settings → Password** if you need the panel for
+   something else. Default passwords: Admin = `easybot`, Operational Mode =
+   `operator` (you'll be forced to change these on first use). Selecting
+   **Manual** Operational Mode forces **Remote Control** back to `Local` (a
+   safety interlock -- Manual assumes a human is directly in control).
+
+   **Neither setting needs to be touched for this repo.** Earlier notes
+   here said the ROS2 driver required Remote Control = `Remote` and
+   Operational Mode = `Automatic`, or motion commands would be silently
+   ignored. Tested directly against this simulator and that turned out
+   wrong: with Operational Mode on `Manual` (so Remote Control forced to
+   `Local`), both `case1/ur_client.py`'s socket backend and the ROS2 driver
+   (`ros2_ur_driver/`) moved the robot exactly on target -- see
+   [`ros2_ur_driver/README.md`](ros2_ur_driver/README.md) for the specifics
+   of that test. Take it as this-simulator-verified, not a general
+   PolyScope X claim; real hardware or a different safety configuration
+   may enforce it for real.
 
 Verify state is readable (from `case1/`):
 

@@ -2,8 +2,9 @@
 
 Notes from getting `ros-humble-ur-robot-driver` talking to the PolyScope X
 (URSim) simulator from `simulation environment/` in a Docker Desktop + WSL2
-setup, including the two non-obvious blockers that stop the robot from
-actually moving.
+setup, including the non-obvious blocker that stops the robot from actually
+moving (a second one this file used to list turned out not to be one --
+see the correction below).
 
 ## What's here
 
@@ -32,17 +33,26 @@ included) — mixing RMWs between processes on the same topics is not reliable.
 Also useful once it's working: `ros2 <cmd> --no-daemon` sidesteps a stuck
 background daemon that was already started under the wrong RMW.
 
-## The two blockers (WSL2 + Docker Desktop specific)
+## The one real blocker (WSL2 + Docker Desktop specific)
 
-1. **Remote Control mode.** PolyScope X refuses external (ROS/script)
-   control until the robot is switched from `Local` to `Remote` control in
-   the web UI (Settings → password-protected panel), and Operational Mode is
-   set to `Automatic`. Default passwords: Admin = `easybot`, Operational
-   Mode = `operator` (you'll be forced to change these on first use).
-   Symptom if skipped: motion commands are accepted but the robot never
-   moves, with no error anywhere.
+**Correction:** this section used to list Remote Control mode as a required
+setup step ("PolyScope X refuses external control until switched from
+`Local` to `Remote`, and Operational Mode set to `Automatic`"). Tested
+directly against this simulator and that's not true here: with Operational
+Mode set to `Manual` (Remote Control forced to `Local` by that -- a safety
+interlock, since Manual assumes a human is directly in control), the driver
+still logged `Robot connected to reverse interface. Ready to receive
+control commands.` on launch, and a `move_joint` through it landed exactly
+on target (`[30, -80, 20, -100, 20, 10]` deg, all six joints). Same result
+for `case1/ur_client.py`'s socket backend. Neither backend needs Remote
+Control on this simulator -- Local/Manual is enough for both. (Password
+defaults if you do need the panel for something else: Admin = `easybot`,
+Operational Mode = `operator`, you'll be forced to change these on first
+use.) Take this as this-simulator-verified, not a general PolyScope X
+claim -- a real robot or a different safety configuration may enforce it
+for real.
 
-2. **`reverse_ip` must not be `127.0.0.1`.** The simulator runs inside a
+1. **`reverse_ip` must not be `127.0.0.1`.** The simulator runs inside a
    Docker container; the driver runs on the WSL2 host. If you launch with
    only `robot_ip:=127.0.0.1`, the driver auto-detects its own address as
    `127.0.0.1` too — which, from *inside the container*, means the
