@@ -19,8 +19,9 @@ Tools, by tier:
   * Silver -- ``get_robot_state``: read joints/TCP/mode/safety without moving.
     ``move_robot_linear``: a TCP-space straight-line move (URScript ``movel``,
     socket backend only -- the ROS2 backend needs IK, not yet implemented).
-  * Gold -- ``move_through_waypoints``: a blended multi-point trajectory, with
-    a state trace of how the move unfolded.
+  * Gold -- ``move_through_waypoints``: a blended multi-point trajectory,
+    streamed live via MCP progress notifications as it moves (plus a full
+    trace in the final result, for a client that isn't watching progress).
   * Diamond -- ``move_robot_to_position_safe``: workspace/speed/forward-
     kinematics safety gate in front of a move; ``set_gripper``: open/close via
     digital IO.
@@ -31,12 +32,14 @@ Return JSON-serializable dicts with explicit units in the key names.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import os
 import sys
 from pathlib import Path
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 from kinematics import forward_kinematics
 from ur_client import HOME_Q_RAD, JOINT_LIMIT, JOINT_NAMES, URClient
@@ -230,15 +233,23 @@ def move_robot_linear(
 
 
 # =========================================================================== #
-# GOLD  --  a trajectory tool with waypoint blending, plus a state trace so an
-# agent can see how a multi-step move unfolded (there's no live push channel
-# to an MCP client mid-call, so this is the trace-after-the-fact version).
+# GOLD  --  a trajectory tool with waypoint blending, streamed live via MCP
+# progress notifications (a genuine push channel, not just a trace-after-the-
+# fact) so a client watching progress sees the move as it happens.
 # =========================================================================== #
+def _state_summary(state) -> dict:
+    return {
+        "joints_deg": {n: round(math.degrees(q), 1) for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+    }
+
+
 @mcp.tool
-def move_through_waypoints(
+async def move_through_waypoints(
     waypoints_deg: list[list[float]],
     speed: float = DEFAULT_SPEED,
     acceleration: float = DEFAULT_ACCEL,
+    ctx: Context | None = None,
 ) -> dict:
     """Move through several joint configurations as one smooth, blended motion.
 
@@ -246,6 +257,10 @@ def move_through_waypoints(
     each waypoint -- it blends through them, which is faster and easier on the
     joints for a multi-point path (e.g. tracing a shape, or a pick-approach-
     place sequence).
+
+    If your client shows MCP progress notifications, you'll see the robot's
+    state pushed live as it moves (an actual push channel, via
+    ``notifications/progress`` -- not just a summary after the fact).
 
     Args:
         waypoints_deg: A list of joint-angle sets, each six degrees in
@@ -257,7 +272,8 @@ def move_through_waypoints(
     Returns:
         A dict with the final ``joints_deg``/``tcp_pose``/``robot_mode``, plus
         ``trace``: a list of ``{joints_deg, tcp_pose}`` snapshots sampled while
-        the robot was moving, so you can see the path it actually took.
+        the robot was moving -- the same data the progress notifications
+        carried, for a client that wasn't watching them live.
 
     Raises:
         ValueError: No waypoints, wrong angle count, or a target past a limit.
@@ -285,22 +301,31 @@ def move_through_waypoints(
                     f"+/-{math.degrees(JOINT_LIMIT):.0f} deg limit."
                 )
 
-    # 4. Execute (blocks until reached), then report the new state + trace.
-    final_state, trace = robot.move_waypoints(waypoints_rad, speed, acceleration)
+    # 4. Execute, streaming a progress notification per polled state, then
+    # report the new state + trace. robot.move_waypoints blocks (plain
+    # sockets/time.sleep, no asyncio) -- run it in a worker thread so the
+    # event loop stays free to actually flush each notification as on_state
+    # fires, instead of queuing them all up behind the blocking call.
+    loop = asyncio.get_running_loop()
+    step = 0
+
+    def on_state(state) -> None:
+        nonlocal step
+        step += 1
+        if ctx is not None:
+            asyncio.run_coroutine_threadsafe(
+                ctx.report_progress(progress=step, message=json.dumps(_state_summary(state))),
+                loop,
+            )
+
+    final_state, trace = await asyncio.to_thread(
+        robot.move_waypoints, waypoints_rad, speed, acceleration, on_state=on_state,
+    )
     return {
         "status": "reached",
-        "joints_deg": {n: round(math.degrees(q), 1)
-                       for n, q in zip(JOINT_NAMES, final_state.q_rad)},
-        "tcp_pose": [round(v, 4) for v in final_state.tcp_pose],
+        **_state_summary(final_state),
         "robot_mode": final_state.robot_mode,
-        "trace": [
-            {
-                "joints_deg": {n: round(math.degrees(q), 1)
-                               for n, q in zip(JOINT_NAMES, s.q_rad)},
-                "tcp_pose": [round(v, 4) for v in s.tcp_pose],
-            }
-            for s in trace
-        ],
+        "trace": [_state_summary(s) for s in trace],
     }
 
 

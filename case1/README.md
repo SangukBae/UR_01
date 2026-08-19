@@ -159,10 +159,29 @@ command is `python3` and whose argument is the absolute path to `server.py`.
   joint-space only and needs IK to accept a Cartesian target).
 - **Gold, richer motion -- done:** `move_through_waypoints`. Blends through a
   list of joint-space waypoints in one motion (no stop-and-restart at each
-  one) and returns a trace of states sampled while it moved, so an agent can
-  see the path it actually took. (MCP tool calls are request/response, not a
-  push channel, so this is a trace-after-the-fact rather than a live feed --
-  see the tool's docstring.)
+  one) and **streams state live** via MCP progress notifications
+  (`notifications/progress`) as it moves -- a real push channel, not a
+  trace-after-the-fact: a client watching progress sees each polled state as
+  soon as it's captured, seconds before the tool call returns (verified in
+  `test_server.py` by timestamping each notification against the call's own
+  duration). The final result also includes the full `trace`, for a client
+  that isn't watching progress. Runs the blocking move in a worker thread
+  (`asyncio.to_thread`) so the event loop stays free to actually flush each
+  notification as it happens, instead of queuing them all up behind the
+  blocking socket/poll loop.
+
+  Finding this also caught a real bug: the socket backend gets no
+  completion signal from the controller for a `movej` program, so it polls
+  and guesses "arrived" by proximity to the *last* waypoint. For a path
+  that loops back near its own start (e.g. out-and-back), that check could
+  pass on the very first poll -- before the robot had moved at all --
+  while the uploaded URScript kept running for real underneath (reproduced
+  while adding the streaming hook: a 3-waypoint round trip "completed" in
+  0.14s client-side while the controller's own program log showed it ran
+  ~1.3s). Fixed with a minimum-duration floor (`_estimate_path_duration`,
+  a trapezoidal-profile estimate summed per segment, mirroring the
+  ros2_client.py backend's own per-segment goal timing) that the tolerance
+  check can't satisfy early.
 - **Diamond, real skills -- done:** `move_robot_to_position_safe` adds a
   safety gate in front of a move -- joint limits, a speed cap, and a
   forward-kinematics workspace-bounds check (`kinematics.py`, nominal DH, a

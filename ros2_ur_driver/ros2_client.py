@@ -351,11 +351,17 @@ class ROS2URClient:
         tol_rad: float = 0.01,
         timeout_s: float = 40.0,
         trace_interval_s: float = 0.3,
+        on_state=None,
     ) -> tuple[RobotState, list[RobotState]]:
         """Move through several joint-space waypoints as one blended trajectory
         (a single FollowJointTrajectory goal with one point per waypoint --
         the controller's own spline interpolation blends between them, no
         stop-and-restart at each one).
+
+        Args:
+            on_state: If given, called synchronously with each polled
+                ``RobotState`` as it's captured -- same live-streaming hook
+                as ur_client.URClient.move_waypoints, see its docstring.
 
         Returns:
             ``(final_state, trace)`` -- same shape as ur_client's
@@ -409,8 +415,11 @@ class ROS2URClient:
                     "(still moving, blocked, or a protective stop?)."
                 )
             if time.monotonic() - last_poll >= trace_interval_s:
-                trace.append(self.get_state())
+                state = self.get_state()
+                trace.append(state)
                 last_poll = time.monotonic()
+                if on_state is not None:
+                    on_state(state)
             time.sleep(0.05)
 
         wrapped = result_future.result()

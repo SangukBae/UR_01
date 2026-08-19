@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastmcp import Client
 
@@ -23,9 +24,17 @@ logging.disable(logging.CRITICAL)
 
 HOME_DEG = [0, -90, 0, -90, 0, 0]
 
+# Populated by on_progress while move_through_waypoints streams live -- see
+# the Gold section below.
+progress_log: list[float] = []
+
+
+async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+    progress_log.append(time.monotonic())
+
 
 async def main() -> None:
-    async with Client(mcp) as client:
+    async with Client(mcp, progress_handler=on_progress) as client:
         names = [t.name for t in await client.list_tools()]
         assert set(names) == {
             "move_robot_to_position", "example",
@@ -94,14 +103,31 @@ async def main() -> None:
         else:
             raise AssertionError("bad linear pose was accepted")
 
-        # Gold: blended multi-waypoint move, with a trace of how it went.
+        # Gold: blended multi-waypoint move, streamed live via MCP progress
+        # notifications as it moves -- not just a trace after the fact.
+        # Slow and far enough (unlike a quick single-step hop) to produce
+        # several updates spread over real time, so the test can verify
+        # they actually arrive while the call is in flight, not all at once
+        # when it returns.
+        progress_log.clear()
+        call_start = time.monotonic()
         path = await client.call_tool("move_through_waypoints", {
-            "waypoints_deg": [[20, -90, 0, -90, 0, 0], HOME_DEG],
+            "waypoints_deg": [[30, -70, 10, -100, 40, 20], [-30, -110, -10, -80, -40, -20], HOME_DEG],
+            "speed": 0.3, "acceleration": 0.6,
         })
+        call_duration = time.monotonic() - call_start
         assert path.data["status"] == "reached"
         assert len(path.data["trace"]) >= 1
-        print("move_through_waypoints:", path.data["joints_deg"],
-              f"({len(path.data['trace'])} trace points)")
+        assert len(progress_log) == len(path.data["trace"]), (
+            "expected one progress notification per trace point",
+            len(progress_log), len(path.data["trace"]),
+        )
+        assert len(progress_log) >= 3, "expected several live updates over a multi-second move, not just one"
+        first_at, last_at = progress_log[0] - call_start, progress_log[-1] - call_start
+        assert last_at <= call_duration + 0.05, "a progress event arrived after the call returned -- not live"
+        print(f"move_through_waypoints: {len(progress_log)} live progress events over "
+              f"{call_duration:.1f}s (first +{first_at:.2f}s, last +{last_at:.2f}s of "
+              f"{call_duration:.1f}s total) -- streamed during the move, not after it")
 
         # Diamond: the safety-gated move succeeds for a reasonable target...
         safe = await client.call_tool(

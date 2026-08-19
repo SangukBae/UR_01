@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # UR joint order: base, shoulder, elbow, wrist1, wrist2, wrist3.
@@ -226,15 +227,24 @@ class URClient:
         tol_rad: float = 0.01,
         timeout_s: float = 40.0,
         trace_interval_s: float = 0.3,
+        on_state: Callable[[RobotState], None] | None = None,
     ) -> tuple[RobotState, list[RobotState]]:
         """Move through several joint-space waypoints in one blended motion.
 
         Every waypoint but the last gets ``blend_radius`` so the robot doesn't
         stop at each one (URScript's ``movej ... r=``); the last is approached
         exactly. Polls state throughout so the caller gets a trace of the move
-        as it happened, not just the final pose (there is no live push channel
-        to an MCP client mid-call, so this is the closest a synchronous tool
-        result gets to "watch it happen").
+        as it happened, not just the final pose.
+
+        Args:
+            on_state: If given, called synchronously with each polled
+                ``RobotState`` as it's captured (same thread, same cadence as
+                the trace) -- this is the live-streaming hook: a caller with
+                its own way of pushing updates out (e.g. server.py's MCP
+                progress notifications) can watch the move as it happens
+                instead of only seeing the trace after the fact. This method
+                itself has no opinion on how -- or whether -- those updates
+                reach anyone; it just calls back.
 
         Returns:
             ``(final_state, trace)`` -- the state on arrival, and every state
@@ -264,8 +274,20 @@ class URClient:
             s.sendall(script.encode())
 
         target = waypoints[-1]
+        # A lower bound on how long the full blended path should take, so the
+        # tolerance check below can't fire before the robot has actually had
+        # time to visit every waypoint. Without this, a path that loops back
+        # to (near) its own start -- e.g. out-and-home -- can match the
+        # target tolerance on the very first poll, before the robot has
+        # moved at all, and return a stale "reached" while the uploaded
+        # URScript program is still running for real on the controller
+        # (reproduced while building the streaming hook above: a 3-waypoint
+        # round trip "completed" in 0.14s client-side while the
+        # controller's own program log showed it actually ran ~1.3s).
+        min_duration_s = self._estimate_path_duration(state.q_rad, waypoints, speed, acceleration)
+        move_start = time.monotonic()
         trace: list[RobotState] = []
-        deadline = time.monotonic() + timeout_s
+        deadline = move_start + timeout_s
         last_poll = 0.0
         while time.monotonic() < deadline:
             time.sleep(0.1)
@@ -273,12 +295,44 @@ class URClient:
             if time.monotonic() - last_poll >= trace_interval_s:
                 trace.append(state)
                 last_poll = time.monotonic()
-            if max(abs(a - b) for a, b in zip(state.q_rad, target)) <= tol_rad:
+                if on_state is not None:
+                    on_state(state)
+            elapsed = time.monotonic() - move_start
+            if (elapsed >= min_duration_s
+                    and max(abs(a - b) for a, b in zip(state.q_rad, target)) <= tol_rad):
                 return state, trace
         raise TimeoutError(
             f"Robot did not reach the last waypoint within {timeout_s:.0f}s "
             "(still moving, blocked, or a protective stop?)."
         )
+
+    @staticmethod
+    def _estimate_path_duration(
+        q_start: list[float], waypoints: list[list[float]], speed: float, acceleration: float,
+    ) -> float:
+        """Trapezoidal-profile time estimate, summed across every segment
+        (start -> waypoint[0] -> waypoint[1] -> ...), max joint per segment.
+        Mirrors the per-segment estimate ros2_client.py already uses to time
+        its own trajectory goals -- here it's a minimum-time floor instead,
+        since the socket backend gets no completion signal from the
+        controller and has to poll-and-guess."""
+        speed = max(speed, 1e-3)
+        acceleration = max(acceleration, 1e-3)
+        t_accel = speed / acceleration
+        d_accel = speed * speed / acceleration
+
+        total = 0.0
+        prev = q_start
+        for wp in waypoints:
+            worst = 0.0
+            for a, b in zip(prev, wp):
+                d = abs(b - a)
+                t = d / speed + t_accel if d >= d_accel else (
+                    2 * math.sqrt(d / acceleration) if d > 0 else 0.0)
+                worst = max(worst, t)
+            total += worst
+            prev = wp
+        return total
 
     # --- Tool IO ---------------------------------------------------------- #
     def set_gripper(self, closed: bool) -> RobotState:
