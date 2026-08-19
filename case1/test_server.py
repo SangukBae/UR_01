@@ -145,12 +145,19 @@ async def main() -> None:
         else:
             raise AssertionError("unsafe speed was accepted")
 
-        # Diamond: gripper open/close.
+        # Diamond: gripper open/close -- "gripper" is a controller readback
+        # (actual_digital_output_bits over RTDE), not an echo of what was
+        # commanded, so this also proves the signal really toggled.
         closed = await client.call_tool("set_gripper", {"state": "close"})
         assert closed.data["gripper"] == "CLOSE"
+        state_closed = await client.call_tool("get_robot_state", {})
+        assert state_closed.data["gripper_closed"] is True, state_closed.data
+
         opened = await client.call_tool("set_gripper", {"state": "OPEN"})
         assert opened.data["gripper"] == "OPEN"
-        print("set_gripper: close/open ok")
+        state_open = await client.call_tool("get_robot_state", {})
+        assert state_open.data["gripper_closed"] is False, state_open.data
+        print("set_gripper: close/open ok, readback confirms the signal toggled")
 
         # Validation: an unknown gripper state must be rejected.
         try:

@@ -139,8 +139,11 @@ Any of these: `move the robot home.`
   safety gate in front of a move -- joint limits, a speed cap, and a
   forward-kinematics workspace-bounds check (`kinematics.py`, nominal DH, a
   coarse estimate) -- and rejects an unsafe command before anything moves.
-  `set_gripper` opens/closes via digital IO. `safety_status` is surfaced by
-  `get_robot_state`.
+  `set_gripper` opens/closes via digital IO, and both it and
+  `get_robot_state`'s `gripper_closed` report the controller's actual
+  readback (`actual_digital_output_bits` over RTDE / `io_states` over
+  ROS2), not just an echo of what was commanded. `safety_status` is
+  surfaced by `get_robot_state`.
 
 Next, not yet built: inverse kinematics for the ROS2 backend, so
 `move_robot_linear` works there too (currently socket-only), and a compound
@@ -171,14 +174,14 @@ implements only as a `NotImplementedError` (see Tiers above).
   - Primary interface (port 30001): motion + gripper. Uploads small URScript
     programs (`movej`, `movel`, `set_digital_out`).
   - RTDE (port 30004): state. Reads joint angles, joint velocities, TCP pose,
-    mode, safety status.
+    mode, safety status, digital output bits (gripper readback).
 - **`../ros2_ur_driver/ros2_client.py`** (`UR_BACKEND=ros2`) -- through
   `ros_humble_ur_robot_driver`:
   - `/scaled_joint_trajectory_controller/follow_joint_trajectory` (action):
     motion.
   - `/io_and_status_controller/set_io` (service): gripper.
   - `/joint_states`, `/tcp_pose_broadcaster/pose`,
-    `/io_and_status_controller/{robot_mode,safety_mode}` (topics): state.
+    `/io_and_status_controller/{robot_mode,safety_mode,io_states}` (topics): state.
 
 Only `UR_HOST` (socket backend) changes to target a real robot instead of the
 simulator; the ROS2 backend instead points at whatever `robot_ip` the driver

@@ -163,9 +163,11 @@ def get_robot_state() -> dict:
     Returns:
         A dict with ``joints_deg`` (per-joint angles), ``joint_speeds_deg_s``
         (per-joint angular velocity), ``tcp_pose`` [x, y, z, rx, ry, rz] in
-        metres and radians, ``robot_mode`` (7 = RUNNING), and ``safety_status``
+        metres and radians, ``robot_mode`` (7 = RUNNING), ``safety_status``
         (1 = NORMAL; anything else means reduced/stopped/faulted -- see UR's
-        SafetyMode).
+        SafetyMode), and ``gripper_closed`` -- the actual digital-output-0
+        state read back from the controller, not just what was last
+        commanded (set_gripper is fire-and-forget; this is the honest check).
     """
     state = robot.get_state()
     return {
@@ -175,6 +177,7 @@ def get_robot_state() -> dict:
         "tcp_pose": [round(v, 4) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
         "safety_status": state.safety_status,
+        "gripper_closed": state.gripper_closed,
     }
 
 
@@ -409,8 +412,10 @@ def set_gripper(state: str) -> dict:
         state: ``"OPEN"`` or ``"CLOSE"`` (case-insensitive).
 
     Returns:
-        A dict with ``gripper`` (the state that was commanded) and the
-        robot's current ``joints_deg``/``tcp_pose``/``robot_mode``.
+        A dict with ``gripper`` (``"CLOSE"``/``"OPEN"``, read back from the
+        controller's actual digital-output-0 state, not just echoing what
+        was commanded) and the robot's current
+        ``joints_deg``/``tcp_pose``/``robot_mode``.
 
     Raises:
         ValueError: ``state`` is neither "OPEN" nor "CLOSE".
@@ -425,7 +430,7 @@ def set_gripper(state: str) -> dict:
     # 4. Execute, then report the new state.
     result = robot.set_gripper(closed=(normalized == "CLOSE"))
     return {
-        "gripper": normalized,
+        "gripper": "CLOSE" if result.gripper_closed else "OPEN",
         "joints_deg": {n: round(math.degrees(q), 1)
                        for n, q in zip(JOINT_NAMES, result.q_rad)},
         "tcp_pose": [round(v, 4) for v in result.tcp_pose],

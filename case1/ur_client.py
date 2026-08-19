@@ -46,7 +46,10 @@ _RTDE_REQUEST_PROTOCOL_VERSION = 86  # 'V'
 _RTDE_SETUP_OUTPUTS = 79             # 'O'
 _RTDE_START = 83                     # 'S'
 _RTDE_DATA_PACKAGE = 85              # 'U'
-_RTDE_OUTPUTS = "actual_q,actual_qd,actual_TCP_pose,robot_mode,safety_status"
+_RTDE_OUTPUTS = (
+    "actual_q,actual_qd,actual_TCP_pose,robot_mode,safety_status,"
+    "actual_digital_output_bits"
+)
 
 DIGITAL_OUT_GRIPPER_PIN = 0  # tool digital output 0, see ur_client.set_gripper
 
@@ -60,6 +63,14 @@ class RobotState:
     tcp_pose: list[float]     # actual TCP pose [x, y, z, rx, ry, rz] (m, rad)
     robot_mode: int           # 7 == RUNNING
     safety_status: int        # 1 == NORMAL
+    digital_output_bits: int  # raw bitmask, all 18 tool+controller digital outputs
+
+    @property
+    def gripper_closed(self) -> bool:
+        """Actual state of DIGITAL_OUT_GRIPPER_PIN, read back from the
+        controller -- not just what was last commanded (see set_gripper's
+        docstring: that call is fire-and-forget, this is the honest check)."""
+        return bool(self.digital_output_bits & (1 << DIGITAL_OUT_GRIPPER_PIN))
 
 
 @dataclass
@@ -107,9 +118,11 @@ class URClient:
         qd = list(struct.unpack(">6d", body[off:off + 48])); off += 48
         tcp = list(struct.unpack(">6d", body[off:off + 48])); off += 48
         mode = struct.unpack(">i", body[off:off + 4])[0]; off += 4
-        safety = struct.unpack(">i", body[off:off + 4])[0]
+        safety = struct.unpack(">i", body[off:off + 4])[0]; off += 4
+        digital_out = struct.unpack(">Q", body[off:off + 8])[0]
         return RobotState(
-            q_rad=q, qd_rad=qd, tcp_pose=tcp, robot_mode=mode, safety_status=safety)
+            q_rad=q, qd_rad=qd, tcp_pose=tcp, robot_mode=mode, safety_status=safety,
+            digital_output_bits=digital_out)
 
     def get_joint_positions(self) -> list[float]:
         """Actual joint angles in radians, base..wrist3."""

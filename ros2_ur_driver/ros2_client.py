@@ -37,6 +37,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 from ur_dashboard_msgs.msg import RobotMode, SafetyMode
+from ur_msgs.msg import IOStates
 from ur_msgs.srv import SetIO
 
 # robot_mode / safety_mode are published TRANSIENT_LOCAL (latched, once on
@@ -74,6 +75,12 @@ class RobotState:
     tcp_pose: list[float]
     robot_mode: int
     safety_status: int
+    digital_output_bits: int
+
+    @property
+    def gripper_closed(self) -> bool:
+        """Same meaning as ur_client.RobotState.gripper_closed -- see its docstring."""
+        return bool(self.digital_output_bits & (1 << DIGITAL_OUT_GRIPPER_PIN))
 
 
 def _quat_to_rotvec(x: float, y: float, z: float, w: float) -> list[float]:
@@ -110,6 +117,7 @@ class ROS2URClient:
         self._tcp_pose: PoseStamped | None = None
         self._robot_mode: int | None = None
         self._safety_mode: int | None = None
+        self._io_states: IOStates | None = None
 
     # --- Lifecycle -------------------------------------------------------- #
     def connect(self, timeout_s: float = 10.0) -> None:
@@ -132,6 +140,8 @@ class ROS2URClient:
         self._node.create_subscription(
             SafetyMode, "/io_and_status_controller/safety_mode",
             self._on_safety_mode, _LATCHED_QOS)
+        self._node.create_subscription(
+            IOStates, "/io_and_status_controller/io_states", self._on_io_states, 10)
         self._action_client = ActionClient(
             self._node, FollowJointTrajectory, f"/{self._controller}/follow_joint_trajectory")
         self._set_io_client = self._node.create_client(
@@ -222,6 +232,9 @@ class ROS2URClient:
     def _on_safety_mode(self, msg: SafetyMode) -> None:
         self._safety_mode = msg.mode
 
+    def _on_io_states(self, msg: IOStates) -> None:
+        self._io_states = msg
+
     # --- State -------------------------------------------------------------#
     def get_state(self) -> RobotState:
         """Latest cached state (subscriptions are pushed continuously in the
@@ -240,12 +253,19 @@ class ROS2URClient:
         rotvec = _quat_to_rotvec(o.x, o.y, o.z, o.w)
         tcp = [p.x, p.y, p.z, *rotvec]
 
+        digital_out_bits = 0
+        if self._io_states is not None:
+            for d in self._io_states.digital_out_states:
+                if d.state:
+                    digital_out_bits |= 1 << d.pin
+
         return RobotState(
             q_rad=q,
             qd_rad=qd,
             tcp_pose=tcp,
             robot_mode=self._robot_mode if self._robot_mode is not None else -1,
             safety_status=self._safety_mode if self._safety_mode is not None else -1,
+            digital_output_bits=digital_out_bits,
         )
 
     def get_joint_positions(self) -> list[float]:
