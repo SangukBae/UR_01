@@ -11,11 +11,15 @@ backends).
 
 | File | Role |
 |------|------|
-| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `example` (template) |
-| `ur_client.py` | socket seam over the robot (motion + state), `UR_BACKEND=socket` (default) |
+| `server.py` | the MCP server (27 tools): `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `move_robot_queued` + `get_queue` (extra, non-blocking move with reject/queue/override semantics), `save_waypoint`/`list_waypoints`/`delete_waypoint`/`move_robot_to_waypoint`/`free_drive` (extra, named-pose database + hand-guided teaching), `move_robot_to_position_relative`/`move_robot_linear_relative`/`move_robot_linear_sequence` (extra, delta/multi-pose variants), `program_new`/`list_programs`/`program_delete`/`program_start`/`program_stop` (extra, named waypoint sequences), `get_vision`/`get_environment`/`get_environment_shadow` (extra, MCP-level passthrough to `vision_human_track`), `track` (extra, crude 1-DOF demo -- see its docstring), `example` (template) |
+| `queue_manager.py` | background-thread command queue backing `move_robot_queued`/`get_queue`/`program_start` -- the non-blocking layer that makes `stop_robot` able to genuinely interrupt a move within one chat turn |
+| `waypoint_store.py` | plain JSON-file-backed waypoint database (`waypoints.json`, gitignored -- local/runtime data) backing the waypoint tools |
+| `program_store.py` | plain JSON-file-backed program database (`programs.json`, gitignored) -- named ordered lists of waypoint names, backing the program tools |
+| `ur_client.py` | socket seam over the robot (motion + state, plus `free_drive`), `UR_BACKEND=socket` (default) |
+| `shadow_client.py` | opt-in shadow-execution wrapper: verifies every move on the simulator first, only replays it on a real robot (`UR_REAL_HOST`) if the simulator move succeeded -- see "Shadow mode" below |
 | `kinematics.py` | nominal UR10 forward kinematics, used only for the Diamond workspace-bounds safety check |
-| `test_server.py` | in-process smoke test for every tool above |
-| `requirements.txt` | one dependency, the MCP framework |
+| `test_server.py` | in-process smoke test for every tool above (vision-passthrough tests skip gracefully if `vision_human_track` isn't running) |
+| `requirements.txt` | dependencies: the MCP framework, `requests` (for the vision-passthrough tools) |
 | `../ros2_ur_driver/ros2_client.py` | ROS2 seam over the robot via `ros_humble_ur_robot_driver`, `UR_BACKEND=ros2` -- same `RobotState` shape and methods as `ur_client.py`, so `server.py`'s tools don't change either way |
 
 ### Two robot backends
@@ -29,6 +33,28 @@ backends).
   architecture (MCP Server -> ROS2 -> UR Driver -> robot). Needs the driver
   already launched -- see `../ros2_ur_driver/README.md` -- and `rclpy` on the
   path (`source /opt/ros/humble/setup.bash`).
+
+### Shadow mode: simulator + a real robot together
+
+Set `UR_REAL_HOST=<real UR controller IP>` (with `UR_BACKEND=socket`) to have
+every move-tool call go through `shadow_client.py`: it runs on the
+**simulator first** and blocks until that succeeds or raises; only then does
+the identical command go to the **real robot**. If the simulator move fails
+(protective stop, timeout, joint limit), the real robot is never touched.
+`stop_robot` is the one exception -- it's sent to both robots independently
+and immediately, never gated behind the other's result. `get_robot_state`
+(and every other state read) reports the real robot once one is configured.
+`free_drive` skips the simulator (no target to verify) and goes straight to
+whichever robot is meant to be hand-guided.
+
+Not enabled by default -- with `UR_REAL_HOST` unset, `robot` is a plain
+`URClient` exactly as before this existed. Not tested against a physical
+robot yet (none is reachable from this sandbox); `test_shadow_client.py`
+exercises the gating logic itself (call order, propagate-vs-swallow,
+`get_state`/`stop` routing) against fake stand-in clients, no network
+needed. Before pointing this at a real arm: confirm the workspace is clear,
+someone has hands on (or near) the physical e-stop, and the target poses
+have already been exercised safely on the simulator alone.
 
 **Don't mix backends against the same live robot in one session** -- the
 socket backend's raw URScript upload knocks out the ROS2 driver's External
@@ -103,7 +129,7 @@ claude mcp list
 ```
 
 GUI clients (Bionic, OpenClaw, Cursor, Claude Desktop): MCP entry, command
-`python3`, arg the absolute path to `server.py` (8 tools on probe). Course
+`python3`, arg the absolute path to `server.py` (27 tools on probe). Course
 guides for Bionic/OpenClaw:
 [`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md),
 [`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)

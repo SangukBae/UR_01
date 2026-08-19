@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+tests/sample_images/*_out.jpg
+tests/sample_images/webcam_test.jpg
+models/*.task

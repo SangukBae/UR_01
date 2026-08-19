@@ -360,6 +360,37 @@ class URClient:
         time.sleep(0.3)  # let the stop take effect before reporting state
         return self.get_state()
 
+    # --- Free-drive (gravity-compensated hand guiding) -------------------- #
+    def free_drive(self, duration_s: float) -> RobotState:
+        """Let the robot be moved freely by hand for ``duration_s`` seconds
+        (URScript ``freedrive_mode()``: gravity-compensated, no target),
+        then re-engage normal position control and report where it ended up
+        -- meant to be followed by a waypoint save of that resulting pose,
+        for a non-programmer workflow ("grab the arm, move it, save that").
+
+        Blocks for the full duration (this call has no target to poll
+        toward, unlike every move_* method -- the duration itself is the
+        only stopping condition).
+        """
+        state = self.get_state()
+        if state.robot_mode != ROBOT_MODE_RUNNING:
+            raise RuntimeError(
+                f"Robot is not powered on (mode {state.robot_mode}, need "
+                f"{ROBOT_MODE_RUNNING}=RUNNING). Open http://localhost and power "
+                "the robot on + release brakes, then try again."
+            )
+        script = (
+            "def free_drive():\n"
+            "  freedrive_mode()\n"
+            f"  sleep({duration_s:.3f})\n"
+            "  end_freedrive_mode()\n"
+            "end\n"
+        )
+        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
+            s.sendall(script.encode())
+        time.sleep(duration_s + 0.5)  # let the controller finish the script
+        return self.get_state()
+
     # --- Tool IO ---------------------------------------------------------- #
     def set_gripper(self, closed: bool) -> RobotState:
         """Set tool digital output 0 (the convention this rig's gripper is

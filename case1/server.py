@@ -31,6 +31,38 @@ Tools, by tier:
     immediately halt any motion in progress. Socket backend always works
     (a fresh upload preempts); ROS2 backend only if a move is still
     in-flight in the same process (see ros2_client.py's ``stop``).
+  * ``move_robot_queued`` / ``get_queue`` -- team architecture-meeting
+    design, additive on top of the four tiers: a move that returns
+    immediately (accept/reject + ETA) instead of blocking until arrival,
+    with reject/queue/override semantics, backed by ``queue_manager.py``'s
+    background worker thread. Makes ``stop_robot`` able to genuinely
+    interrupt a move within the same chat turn (the plain tiered move
+    tools above are unchanged and still block).
+  * ``save_waypoint`` / ``list_waypoints`` / ``delete_waypoint`` /
+    ``move_robot_to_waypoint`` / ``free_drive`` -- team architecture-
+    meeting design: named poses persisted to disk (``waypoint_store.py``,
+    a plain JSON file), and a free-drive tool (socket backend only) so a
+    non-programmer can move the robot by hand and save the result instead
+    of typing joint angles.
+  * ``move_robot_to_position_relative`` / ``move_robot_linear_relative`` /
+    ``move_robot_linear_sequence`` -- block-diagram tool list: relative
+    (delta-from-current) variants of the absolute move tools, and a
+    TCP-space multi-pose sequence that doesn't blend (each leg fully
+    stops before the next), unlike move_through_waypoints.
+  * ``program_new`` / ``list_programs`` / ``program_delete`` /
+    ``program_start`` / ``program_stop`` -- block-diagram tool list: a
+    named, ordered sequence of already-saved waypoints
+    (``program_store.py``, another plain JSON file), run non-blocking via
+    the same queue as ``move_robot_queued``.
+  * ``get_vision`` / ``get_environment`` / ``get_environment_shadow`` --
+    block-diagram tool list: MCP-level access to the ``vision_human_track``
+    service (a separate HTTP service, see its README) for who/what is in
+    view. ``get_environment_shadow`` reads an always-fresh background
+    cache instead of paying a live round-trip.
+  * ``track`` -- block-diagram tool list, deliberately crude: no camera<->
+    robot calibration exists in this repo, so this only turns the base
+    joint toward a hand's left/right position in frame -- a demo of the
+    reactive loop, not real 3D tracking.
 
 Return JSON-serializable dicts with explicit units in the key names.
 """
@@ -41,12 +73,23 @@ import json
 import math
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
+import requests
 from fastmcp import Context, FastMCP
 
+import program_store
+import waypoint_store
 from kinematics import forward_kinematics
+from queue_manager import CommandQueue
 from ur_client import HOME_Q_RAD, JOINT_LIMIT, JOINT_NAMES, URClient
+
+# vision_human_track's REST API (separate process/container -- see
+# ../vision_human_track/README.md). Not required to be running for any
+# tool except get_vision/get_environment/get_environment_shadow/track.
+VISION_API_URL = os.environ.get("VISION_API_URL", "http://localhost:8000").rstrip("/")
 
 mcp = FastMCP("ur-tools")
 
@@ -66,6 +109,72 @@ elif _BACKEND == "socket":
     robot = URClient()
 else:
     raise ValueError(f"Unknown UR_BACKEND={_BACKEND!r}, expected 'socket' or 'ros2'.")
+
+# Shadow mode (opt-in, see shadow_client.py): set UR_REAL_HOST to a real UR
+# controller's IP to have every move verified on the simulator FIRST, then
+# replayed on the real robot only if the simulator move succeeds. Unset
+# (the default) -- nothing here changes, `robot` stays a plain client
+# talking only to UR_HOST/the simulator, exactly as before this existed.
+_REAL_HOST = os.environ.get("UR_REAL_HOST")
+if _REAL_HOST:
+    if _BACKEND != "socket":
+        raise ValueError(
+            "UR_REAL_HOST (shadow mode) is only supported with UR_BACKEND="
+            "socket for now -- the ROS2 backend talks to one controller "
+            "per process, not two."
+        )
+    from shadow_client import ShadowClient
+
+    robot = ShadowClient(sim=robot, real=URClient(host=_REAL_HOST))
+
+# Non-blocking command queue (team architecture meeting design) backing
+# move_robot_queued/get_queue below. The original tiered tools above are
+# left blocking and unchanged -- this is an additive layer, not a
+# replacement, so the graded Bronze-Diamond tools keep working exactly as
+# before.
+_queue = CommandQueue()
+
+
+def _state_summary(state) -> dict:
+    return {
+        "joints_deg": {n: round(math.degrees(q), 1) for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+    }
+
+
+# Environment Shadow: a background thread keeps a continuously refreshed
+# cache of the latest vision detection + robot state, so get_environment_
+# shadow() answers instantly instead of paying a live round-trip every
+# time -- the meeting's own concern that vision-on-demand alone leaves the
+# LLM "blind" between calls (see meeting notes, section M). get_vision/
+# get_environment below are the on-demand/live versions; this is the
+# always-fresh cached one.
+_shadow_lock = threading.Lock()
+_shadow = {"vision": None, "vision_error": None, "robot_state": None, "updated_at": None}
+
+
+def _shadow_loop() -> None:
+    while True:
+        update = {"updated_at": time.time()}
+        try:
+            resp = requests.post(f"{VISION_API_URL}/detect/live", timeout=2.0)
+            resp.raise_for_status()
+            update["vision"] = resp.json()
+            update["vision_error"] = None
+        except requests.RequestException as exc:
+            update["vision"] = None
+            update["vision_error"] = str(exc)
+        try:
+            update["robot_state"] = _state_summary(robot.get_state())
+        except Exception:  # noqa: BLE001 - don't let a transient read error kill the loop
+            update["robot_state"] = None
+        with _shadow_lock:
+            _shadow.update(update)
+        time.sleep(1.0)
+
+
+threading.Thread(target=_shadow_loop, daemon=True).start()
+
 
 # Conservative joint-move defaults (rad/s, rad/s^2).
 DEFAULT_SPEED = 1.0
@@ -240,15 +349,178 @@ def move_robot_linear(
 
 
 # =========================================================================== #
+# RELATIVE MOVES  --  block-diagram tool list, additive: the same joint/TCP
+# moves above, but "move this much from here" instead of "move to this
+# absolute target" -- reads the current pose first, adds the delta, then
+# reuses the exact same validate/execute path as the absolute version.
+# =========================================================================== #
+@mcp.tool
+def move_robot_to_position_relative(
+    delta_deg: list[float],
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+) -> dict:
+    """Move each joint by a relative amount from wherever it is now.
+
+    Args:
+        delta_deg: Six angle changes in degrees, base..wrist3 (e.g.
+            ``[0, 0, 0, 0, 0, 90]`` turns only wrist3 by +90 deg from its
+            current angle). Use move_robot_to_position for an absolute target.
+        speed: Joint speed (rad/s).
+        acceleration: Joint acceleration (rad/s^2).
+
+    Returns:
+        Same shape as move_robot_to_position: ``status``, ``target_deg``
+        (the resulting absolute target this resolved to), ``joints_deg``,
+        ``tcp_pose``, ``robot_mode``.
+
+    Raises:
+        ValueError: Wrong number of deltas, or the resulting absolute
+            target exceeds a joint limit.
+        RuntimeError: The robot is not powered on.
+    """
+    # 1. Validate inputs.
+    if len(delta_deg) != len(JOINT_NAMES):
+        raise ValueError(
+            f"Expected {len(JOINT_NAMES)} deltas ({', '.join(JOINT_NAMES)}), "
+            f"got {len(delta_deg)}."
+        )
+
+    # 2. Resolve to an absolute target (current + delta), then convert to radians.
+    current_deg = [math.degrees(q) for q in robot.get_state().q_rad]
+    target_deg = [c + d for c, d in zip(current_deg, delta_deg)]
+    target_rad = [math.radians(a) for a in target_deg]
+
+    # 3. Check feasibility against the software joint limits.
+    for name, angle_rad, angle_deg in zip(JOINT_NAMES, target_rad, target_deg):
+        if abs(angle_rad) > JOINT_LIMIT:
+            raise ValueError(
+                f"Delta for {name} resolves to {angle_deg:.1f} deg, exceeding "
+                f"the +/-{math.degrees(JOINT_LIMIT):.0f} deg limit."
+            )
+
+    # 4. Execute (blocks until reached), then report the new state.
+    state = robot.move_joint(target_rad, speed, acceleration)
+    return {
+        "status": "reached",
+        "target_deg": {n: round(a, 1) for n, a in zip(JOINT_NAMES, target_deg)},
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+    }
+
+
+@mcp.tool
+def move_robot_linear_relative(
+    delta: list[float],
+    speed: float = DEFAULT_LINEAR_SPEED,
+    acceleration: float = DEFAULT_LINEAR_ACCEL,
+) -> dict:
+    """Move the TCP in a straight line by a relative offset from its current pose.
+
+    Args:
+        delta: Six numbers ``[dx, dy, dz, drx, dry, drz]`` added to the
+            current TCP pose -- metres for position, radians for the
+            rotation-vector components. E.g. ``[0, 0, 0.05, 0, 0, 0]`` lifts
+            5cm straight up. Note: adding rotation-vector components is only
+            a good approximation for small rotations, not true rotation
+            composition -- keep drx/dry/drz small.
+        speed: TCP speed (m/s).
+        acceleration: TCP acceleration (m/s^2).
+
+    Returns:
+        Same shape as move_robot_linear: ``status``, ``target_tcp_pose``
+        (the resulting absolute pose this resolved to), ``joints_deg``,
+        ``tcp_pose``, ``robot_mode``.
+
+    Raises:
+        ValueError: ``delta`` isn't exactly 6 numbers.
+        RuntimeError: The robot is not powered on.
+        NotImplementedError: UR_BACKEND=ros2 (see move_robot_linear).
+    """
+    # 1. Validate inputs.
+    if len(delta) != 6:
+        raise ValueError(f"Expected 6 values [dx,dy,dz,drx,dry,drz], got {len(delta)}.")
+
+    # 2. Resolve to an absolute target pose (current + delta).
+    current_pose = robot.get_state().tcp_pose
+    target_pose = [c + d for c, d in zip(current_pose, delta)]
+
+    # 3. No limit check -- the controller rejects an unreachable pose itself.
+    # 4. Execute (blocks until reached), then report the new state.
+    state = robot.move_linear(target_pose, speed, acceleration)
+    return {
+        "status": "reached",
+        "target_tcp_pose": [round(v, 4) for v in target_pose],
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+    }
+
+
+@mcp.tool
+def move_robot_linear_sequence(
+    tcp_poses: list[list[float]],
+    speed: float = DEFAULT_LINEAR_SPEED,
+    acceleration: float = DEFAULT_LINEAR_ACCEL,
+) -> dict:
+    """Move the TCP in a straight line through several absolute poses in order.
+
+    Unlike move_through_waypoints (joint-space, blended into one smooth
+    motion), this is TCP-space and does NOT blend -- the robot fully stops
+    at each pose before starting the next straight line to the following
+    one. Use it when every leg of the path needs to be a genuine straight
+    line (move_through_waypoints' blending curves slightly through each
+    intermediate point).
+
+    Args:
+        tcp_poses: A list of absolute ``[x, y, z, rx, ry, rz]`` poses, at
+            least one required.
+        speed: TCP speed (m/s), shared by every leg.
+        acceleration: TCP acceleration (m/s^2), shared by every leg.
+
+    Returns:
+        A dict with the final ``joints_deg``/``tcp_pose``/``robot_mode``,
+        plus ``trace``: a ``tcp_pose`` snapshot after each leg.
+
+    Raises:
+        ValueError: No poses given, or one isn't exactly 6 numbers.
+        RuntimeError: The robot is not powered on.
+        NotImplementedError: UR_BACKEND=ros2 (see move_robot_linear).
+    """
+    # 1. Validate inputs.
+    if not tcp_poses:
+        raise ValueError("Need at least one pose.")
+    for i, pose in enumerate(tcp_poses):
+        if len(pose) != 6:
+            raise ValueError(f"Pose {i} has {len(pose)} values, expected 6.")
+
+    # 2-3. No unit conversion or limit check -- the controller rejects an
+    # unreachable pose itself, same as the single-pose version.
+    # 4. Execute each leg in order (blocks until each is reached), then
+    # report the final state plus a trace of every leg's result.
+    trace = []
+    state = None
+    for pose in tcp_poses:
+        state = robot.move_linear(list(pose), speed, acceleration)
+        trace.append({"tcp_pose": [round(v, 4) for v in state.tcp_pose]})
+    return {
+        "status": "reached",
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+        "trace": trace,
+    }
+
+
+# =========================================================================== #
 # GOLD  --  a trajectory tool with waypoint blending, streamed live via MCP
 # progress notifications (a genuine push channel, not just a trace-after-the-
 # fact) so a client watching progress sees the move as it happens.
 # =========================================================================== #
-def _state_summary(state) -> dict:
-    return {
-        "joints_deg": {n: round(math.degrees(q), 1) for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
-    }
 
 
 @mcp.tool
@@ -334,6 +606,104 @@ async def move_through_waypoints(
         "robot_mode": final_state.robot_mode,
         "trace": [_state_summary(s) for s in trace],
     }
+
+
+# =========================================================================== #
+# QUEUE  --  team architecture-meeting design, additive to the four tiers:
+# a move that returns immediately (accept/reject + ETA) instead of blocking
+# until the robot arrives, backed by CommandQueue's background worker
+# thread. This is what makes stop_robot() able to genuinely interrupt a
+# move within the same chat turn -- see stop_robot's docstring.
+# =========================================================================== #
+@mcp.tool
+def move_robot_queued(
+    joint_angles_deg: list[float] | None = None,
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+    mode: str = "reject",
+) -> dict:
+    """Request a joint move without blocking until it arrives.
+
+    Unlike move_robot_to_position, this returns immediately with an
+    accept/reject decision and an estimated duration; the actual motion
+    runs in the background. Poll get_robot_state() or get_queue() to see
+    when it finishes, and call stop_robot() any time to interrupt it --
+    that only works because this tool doesn't block the way the plain
+    move tools do.
+
+    Args:
+        joint_angles_deg: Six target angles in degrees, base..wrist3.
+            Defaults to the home pose when omitted.
+        speed: Joint speed (rad/s).
+        acceleration: Joint acceleration (rad/s^2).
+        mode: What to do if a command is already running or queued.
+            "reject" (default): refuse this request, nothing changes.
+            "queue": run this one after the current queue finishes.
+            "override": cancel everything running/queued and run this now.
+
+    Returns:
+        A dict with ``status`` ("accepted"/"queued"/"accepted_override"/
+        "rejected"), ``command_id`` (absent on "rejected"),
+        ``estimated_duration_s``, and ``queue`` -- the full current/pending
+        queue state, same shape get_queue() returns.
+
+    Raises:
+        ValueError: Wrong number of angles, a target past the joint limit,
+            or ``mode`` isn't one of "reject"/"queue"/"override".
+    """
+    # 1. Validate inputs.
+    if joint_angles_deg is None:
+        joint_angles_deg = list(HOME_DEG)
+    if len(joint_angles_deg) != len(JOINT_NAMES):
+        raise ValueError(
+            f"Expected {len(JOINT_NAMES)} joint angles "
+            f"({', '.join(JOINT_NAMES)}), got {len(joint_angles_deg)}."
+        )
+
+    # 2. Convert the request (degrees) to the robot's units (radians).
+    target_rad = [math.radians(a) for a in joint_angles_deg]
+
+    # 3. Check feasibility against the software joint limits.
+    for name, angle_rad, angle_deg in zip(JOINT_NAMES, target_rad, joint_angles_deg):
+        if abs(angle_rad) > JOINT_LIMIT:
+            raise ValueError(
+                f"Target {angle_deg} deg for {name} exceeds the +/-"
+                f"{math.degrees(JOINT_LIMIT):.0f} deg limit. Choose a smaller angle."
+            )
+
+    # 4. Submit to the queue (returns immediately) instead of executing here.
+    current_state = robot.get_state()
+    eta_s = URClient._estimate_path_duration(
+        current_state.q_rad, [target_rad], speed, acceleration
+    )
+
+    def _do_move() -> dict:
+        return _state_summary(robot.move_joint(target_rad, speed, acceleration))
+
+    result = _queue.submit(
+        kind="move_joint",
+        fn=_do_move,
+        meta={
+            "target_deg": {n: round(a, 1) for n, a in zip(JOINT_NAMES, joint_angles_deg)},
+            "estimated_duration_s": round(eta_s, 2),
+        },
+        mode=mode,
+    )
+    result["estimated_duration_s"] = round(eta_s, 2)
+    return result
+
+
+@mcp.tool
+def get_queue() -> dict:
+    """Check what the non-blocking command queue is doing right now.
+
+    Returns:
+        A dict with ``current`` (the in-progress command, or null if idle
+        -- ``id``, ``kind``, ``meta``, ``status``), ``pending`` (queued
+        commands waiting their turn, same shape), and ``queue_length``.
+        Poll this after move_robot_queued instead of blocking on it.
+    """
+    return _queue.describe()
 
 
 # =========================================================================== #
@@ -443,6 +813,490 @@ def set_gripper(state: str) -> dict:
 
 
 # =========================================================================== #
+# WAYPOINT DB + FREE-DRIVE  --  team architecture-meeting design, additive
+# on top of the four tiers: named poses persisted to disk (waypoint_store.py,
+# a plain JSON file -- "the database" from the meeting), and a free-drive
+# tool so a non-programmer can move the robot by hand and save the result,
+# rather than typing joint angles.
+# =========================================================================== #
+@mcp.tool
+def save_waypoint(name: str) -> dict:
+    """Save the robot's current pose under a name, for later recall with
+    move_robot_to_waypoint.
+
+    Args:
+        name: A label to save this pose under. Saving again under an
+            existing name overwrites it.
+
+    Returns:
+        A dict with ``name``, ``joints_deg``, and ``tcp_pose`` for what was
+        just saved.
+    """
+    # 1-3. No inputs to validate beyond name being a string, no units to
+    # convert -- this reads whatever pose the robot is already in.
+    # 4. Execute (a state read, not a move), then report what was saved.
+    state = robot.get_state()
+    waypoint_store.save_waypoint(name, list(state.q_rad), list(state.tcp_pose))
+    return {
+        "name": name,
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+    }
+
+
+@mcp.tool
+def list_waypoints() -> dict:
+    """List every saved waypoint.
+
+    Returns:
+        A dict with ``waypoints``, mapping each saved name to its
+        ``joints_deg``, ``tcp_pose``, and ``saved_at`` (unix timestamp) --
+        an empty dict if none are saved yet.
+    """
+    # Nested under "waypoints" rather than returned as the top-level dict:
+    # an empty top-level dict ({}) was observed to deserialize as None on
+    # the client side (verified live, see CLAUDE.md's verified findings) --
+    # wrapping it guarantees a non-empty structure regardless.
+    saved = waypoint_store.list_waypoints()
+    return {
+        "waypoints": {
+            name: {
+                "joints_deg": {n: round(math.degrees(q), 1)
+                               for n, q in zip(JOINT_NAMES, entry["q_rad"])},
+                "tcp_pose": [round(v, 4) for v in entry["tcp_pose"]],
+                "saved_at": entry["saved_at"],
+            }
+            for name, entry in saved.items()
+        }
+    }
+
+
+@mcp.tool
+def delete_waypoint(name: str) -> dict:
+    """Delete a saved waypoint.
+
+    Args:
+        name: The waypoint to remove.
+
+    Returns:
+        A dict with ``status: "deleted"`` and the ``name`` removed.
+
+    Raises:
+        ValueError: No waypoint is saved under that name.
+    """
+    # 1. Validate: the name must actually exist.
+    try:
+        waypoint_store.delete_waypoint(name)
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+    # 2-4. No units, no limits, no motion -- just remove the record.
+    return {"status": "deleted", "name": name}
+
+
+@mcp.tool
+def move_robot_to_waypoint(
+    name: str,
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+) -> dict:
+    """Move to a previously saved waypoint by name.
+
+    Args:
+        name: A waypoint saved earlier with save_waypoint.
+        speed: Joint speed (rad/s).
+        acceleration: Joint acceleration (rad/s^2).
+
+    Returns:
+        Same shape as move_robot_to_position: ``status``, ``joints_deg``,
+        ``tcp_pose``, ``robot_mode``.
+
+    Raises:
+        ValueError: No waypoint is saved under that name.
+        RuntimeError: The robot is not powered on.
+    """
+    # 1. Validate: the name must exist.
+    try:
+        entry = waypoint_store.get_waypoint(name)
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+
+    # 2. Already stored in the robot's units (radians) -- no conversion.
+    target_rad = entry["q_rad"]
+
+    # 3. Feasibility already passed when the pose was saved (it was a real
+    # robot state) -- no re-check needed.
+    # 4. Execute (blocks until reached), then report the new state.
+    state = robot.move_joint(target_rad, speed, acceleration)
+    return {
+        "status": "reached",
+        "waypoint": name,
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+    }
+
+
+@mcp.tool
+def free_drive(duration_s: float = 10.0) -> dict:
+    """Let the robot be moved freely by hand for a set duration (gravity-
+    compensated, no target -- a human physically pushes it), then resume
+    normal control and report where it ended up.
+
+    Meant for a non-programmer workflow: call this, physically move the
+    arm to where you want it while it's still running, then call
+    save_waypoint once it returns to capture that pose.
+
+    Args:
+        duration_s: How long to stay in free-drive, in seconds. This call
+            blocks for the full duration -- there's no target to poll
+            toward, unlike the move_* tools.
+
+    Returns:
+        A dict with ``joints_deg`` and ``tcp_pose`` for the pose the robot
+        was left in when free-drive ended.
+
+    Raises:
+        ValueError: duration_s isn't positive.
+        RuntimeError: The robot is not powered on, or UR_BACKEND=ros2
+            (socket backend only -- see ur_client.py's free_drive).
+    """
+    # 1. Validate inputs.
+    if duration_s <= 0:
+        raise ValueError(f"duration_s must be positive, got {duration_s}.")
+
+    # 2-3. No unit conversion or limit check -- free-drive has no target.
+    # 4. Execute (blocks for duration_s), then report the resulting state.
+    state = robot.free_drive(duration_s)
+    return {
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+    }
+
+
+# =========================================================================== #
+# PROGRAMS  --  block-diagram tool list: a named, ordered sequence of
+# already-saved waypoints (program_store.py, another plain JSON file) --
+# "run these spots in this order" as a single callable unit, distinct from
+# recalling one waypoint at a time.
+# =========================================================================== #
+@mcp.tool
+def program_new(name: str, waypoint_names: list[str]) -> dict:
+    """Save a named program: an ordered list of already-saved waypoints to
+    run in sequence.
+
+    Args:
+        name: A label for this program. Saving again under an existing
+            name overwrites it.
+        waypoint_names: Waypoint names (from save_waypoint), in run order.
+            At least one required; every name must already exist.
+
+    Returns:
+        A dict with ``name`` and ``waypoint_names`` for what was just saved.
+
+    Raises:
+        ValueError: The list is empty, or one of the names isn't a saved waypoint.
+    """
+    # 1. Validate inputs: non-empty, and every referenced waypoint exists.
+    if not waypoint_names:
+        raise ValueError("Need at least one waypoint name.")
+    for wp_name in waypoint_names:
+        try:
+            waypoint_store.get_waypoint(wp_name)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+
+    # 2-3. No units, no motion -- just record the sequence.
+    # 4. Execute (a store write, not a move), then report what was saved.
+    program_store.save_program(name, waypoint_names)
+    return {"name": name, "waypoint_names": list(waypoint_names)}
+
+
+@mcp.tool
+def list_programs() -> dict:
+    """List every saved program.
+
+    Returns:
+        A dict with ``programs``, mapping each name to its
+        ``waypoint_names`` and ``saved_at`` (unix timestamp).
+    """
+    return {"programs": program_store.list_programs()}
+
+
+@mcp.tool
+def program_delete(name: str) -> dict:
+    """Delete a saved program (the waypoints it references are untouched).
+
+    Args:
+        name: The program to remove.
+
+    Returns:
+        A dict with ``status: "deleted"`` and the ``name`` removed.
+
+    Raises:
+        ValueError: No program is saved under that name.
+    """
+    try:
+        program_store.delete_program(name)
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"status": "deleted", "name": name}
+
+
+@mcp.tool
+def program_start(
+    name: str,
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+    mode: str = "reject",
+) -> dict:
+    """Run a saved program: move through its waypoints in order.
+
+    Non-blocking, same as move_robot_queued -- returns immediately with an
+    accept/reject decision, runs in the background, and can be interrupted
+    with stop_robot (or program_stop, identical) partway through.
+
+    Args:
+        name: A program saved earlier with program_new.
+        speed: Joint speed (rad/s), shared by every leg.
+        acceleration: Joint acceleration (rad/s^2), shared by every leg.
+        mode: Same as move_robot_queued -- "reject" (default), "queue", or
+            "override" if a command is already running/queued.
+
+    Returns:
+        Same shape as move_robot_queued: ``status``, ``command_id``,
+        ``estimated_duration_s``, ``queue``.
+
+    Raises:
+        ValueError: No program is saved under that name, or ``mode`` isn't
+            "reject"/"queue"/"override".
+    """
+    # 1. Validate: the program must exist, and every waypoint it references
+    # must still exist (it might have been deleted since the program was saved).
+    try:
+        entry = program_store.get_program(name)
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+    try:
+        legs = [waypoint_store.get_waypoint(wp)["q_rad"] for wp in entry["waypoint_names"]]
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+
+    # 2. Already stored in radians -- no conversion.
+    # 3. Feasibility already passed when each waypoint was saved.
+    current_q = robot.get_state().q_rad
+    eta_s = sum(
+        URClient._estimate_path_duration(prev, [leg], speed, acceleration)
+        for prev, leg in zip([current_q, *legs[:-1]], legs)
+    )
+
+    def _run_program() -> dict:
+        state = None
+        for leg in legs:
+            state = robot.move_joint(leg, speed, acceleration)
+        return _state_summary(state)
+
+    # 4. Submit to the queue (returns immediately) instead of executing here.
+    result = _queue.submit(
+        kind="program",
+        fn=_run_program,
+        meta={"program": name, "waypoint_names": entry["waypoint_names"],
+              "estimated_duration_s": round(eta_s, 2)},
+        mode=mode,
+    )
+    result["estimated_duration_s"] = round(eta_s, 2)
+    return result
+
+
+@mcp.tool
+def program_stop() -> dict:
+    """Immediately halt a running program (and any other queued/running
+    command). Identical to stop_robot -- provided under this name too since
+    that's what the team's tool list calls it.
+
+    Returns:
+        Same shape as stop_robot.
+    """
+    return stop_robot()
+
+
+# =========================================================================== #
+# VISION PASSTHROUGH  --  block-diagram tool list: MCP-level access to the
+# vision_human_track service (../vision_human_track/), so an LLM can ask
+# "what/who is in view" without the caller needing to know that's a
+# separate HTTP service. get_vision/get_environment are on-demand (pay a
+# live round-trip); get_environment_shadow reads the always-fresh
+# background cache above instead.
+# =========================================================================== #
+def _call_vision_api() -> dict:
+    try:
+        resp = requests.post(f"{VISION_API_URL}/detect/live", timeout=5.0)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Vision service unreachable at {VISION_API_URL} ({exc}). Is "
+            "vision_human_track running? See its README (docker compose up "
+            "-d, or the local venv)."
+        ) from exc
+    return resp.json()
+
+
+@mcp.tool
+def get_vision() -> dict:
+    """Take a snapshot from the vision service's camera and return the raw
+    detection: every detected person's skeleton and hands, full detail.
+
+    For most purposes get_environment (a summarized list) or
+    get_environment_shadow (cached, no round-trip) is more useful -- use
+    this when the full per-joint skeleton/hand landmark detail is actually
+    needed.
+
+    Returns:
+        The vision service's raw JSON response (see
+        ../vision_human_track/README.md's API contract).
+
+    Raises:
+        RuntimeError: The vision service isn't reachable.
+    """
+    return _call_vision_api()
+
+
+@mcp.tool
+def get_environment() -> dict:
+    """Take a snapshot of who/what is currently in view, summarized.
+
+    Non-destructive check before acting -- e.g. confirm a person is
+    actually visible before doing something that assumes they are.
+
+    Note: only reports people/hands (this repo's Vision Stack scope).
+    Object detection (apple/cup/etc.) is a separate, not-yet-integrated
+    service -- see ../vision_human_track/README.md.
+
+    Returns:
+        A dict with ``humans``: a list of ``{id, num_hands, hands: [{
+        handedness, palm_center, normal}]}`` -- position/orientation only,
+        not the full per-joint skeleton (see get_vision for that).
+
+    Raises:
+        RuntimeError: The vision service isn't reachable.
+    """
+    data = _call_vision_api()
+    humans = []
+    for h in data.get("humans", []):
+        humans.append({
+            "id": h["id"],
+            "num_hands": len(h["hands"]),
+            "hands": [
+                {"handedness": hand["handedness"], "palm_center": hand["palm_center"],
+                 "normal": hand["normal"]}
+                for hand in h["hands"]
+            ],
+        })
+    return {"humans": humans}
+
+
+@mcp.tool
+def get_environment_shadow() -> dict:
+    """Read the last cached vision snapshot + robot state, refreshed about
+    once a second in the background -- no live round-trip, so this is
+    effectively free to call often (e.g. to check "has anything changed"
+    without the latency of get_vision/get_environment).
+
+    Returns:
+        A dict with ``vision`` (same shape as get_vision's result, or null
+        if the vision service was unreachable at the last refresh --
+        check ``vision_error`` for why), ``robot_state`` (``joints_deg``/
+        ``tcp_pose``), and ``age_s`` (seconds since this snapshot was
+        taken -- large means the background refresh has stalled).
+    """
+    with _shadow_lock:
+        snapshot = dict(_shadow)
+    age_s = None if snapshot["updated_at"] is None else round(time.time() - snapshot["updated_at"], 2)
+    return {
+        "vision": snapshot["vision"],
+        "vision_error": snapshot["vision_error"],
+        "robot_state": snapshot["robot_state"],
+        "age_s": age_s,
+    }
+
+
+# =========================================================================== #
+# TRACKING  --  block-diagram tool list. Deliberately crude: there is no
+# camera<->robot extrinsic calibration anywhere in this repo (see
+# ../vision_human_track/README.md and ../ros2_vision_bridge/README.md), so
+# there's no way to compute a real 3D robot target from a camera-frame
+# hand position. This maps a hand's horizontal position in frame to a
+# base-joint angle (1 degree of freedom, roughly "turn toward the hand"),
+# not real 3D tracking -- a demo of the loop, not a finished feature.
+# =========================================================================== #
+@mcp.tool
+def track(duration_s: float = 10.0, poll_hz: float = 2.0) -> dict:
+    """Roughly turn the robot's base to follow a hand's left/right position
+    in the camera view, for a set duration.
+
+    Crude by design (see module notes): only the base joint moves, driven
+    by the hand's horizontal position in the image -- not a real 3D
+    tracking of the hand's actual position, because there's no camera<->
+    robot coordinate calibration in this repo yet. A demo of "vision ->
+    MCP -> robot reacts continuously", not a finished tracking feature.
+
+    Args:
+        duration_s: How long to track for, in seconds. Blocks for the
+            full duration.
+        poll_hz: How often to sample the vision service and re-aim, in Hz.
+
+    Returns:
+        A dict with ``updates`` (how many times a hand was seen and the
+        base was re-aimed) and the final ``joints_deg``.
+
+    Raises:
+        ValueError: duration_s or poll_hz isn't positive.
+        RuntimeError: The robot is not powered on. (Vision-unreachable
+            polls are skipped, not raised -- tracking just pauses until
+            the vision service comes back or duration_s runs out.)
+    """
+    # 1. Validate inputs.
+    if duration_s <= 0:
+        raise ValueError(f"duration_s must be positive, got {duration_s}.")
+    if poll_hz <= 0:
+        raise ValueError(f"poll_hz must be positive, got {poll_hz}.")
+
+    # 2-3. No unit conversion or limit check up front -- each re-aim below
+    # reuses move_robot_to_position_relative's own clamp-free small delta.
+    # 4. Poll-and-react loop for duration_s, then report the final state.
+    updates = 0
+    deadline = time.monotonic() + duration_s
+    base_target_deg = math.degrees(robot.get_state().q_rad[0])
+    while time.monotonic() < deadline:
+        try:
+            data = _call_vision_api()
+        except RuntimeError:
+            time.sleep(1.0 / poll_hz)
+            continue
+        hands = [h for human in data.get("humans", []) for h in human["hands"]]
+        hands += data.get("unassigned_hands", [])
+        if hands:
+            hand_x = hands[0]["palm_center"][0]  # normalized [0,1], 0=left
+            base_target_deg = (hand_x - 0.5) * 2 * 45  # [0,1] -> [-45, +45] deg
+            current = robot.get_state()
+            target_rad = list(current.q_rad)
+            target_rad[0] = math.radians(base_target_deg)
+            if abs(target_rad[0]) <= JOINT_LIMIT:
+                robot.move_joint(target_rad, 0.5, 1.0)
+                updates += 1
+        time.sleep(1.0 / poll_hz)
+
+    final_state = robot.get_state()
+    return {
+        "updates": updates,
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, final_state.q_rad)},
+    }
+
+
+# =========================================================================== #
 # EMERGENCY STOP  --  team requirement, not one of the four tiers: halt any
 # motion in progress right now, not the next command in a queue.
 # =========================================================================== #
@@ -459,21 +1313,34 @@ def stop_robot() -> dict:
     process -- a stop issued after that call has already returned has
     nothing to cancel.
 
-    Note: within one chat turn, tool calls run one at a time -- calling
-    this from the same conversation that is still waiting on a move to
-    finish won't interrupt that move, because this call can't start until
-    the earlier one returns. It's here to be called between turns, or from
-    a second, concurrent client.
+    Also cancels the non-blocking queue (see move_robot_queued/get_queue):
+    every pending command is dropped, and the currently-running one (if
+    any) is flagged cancelled -- so a stop_robot() call genuinely interrupts
+    a move that was started with move_robot_queued, from the very next tool
+    call, because that move didn't block the tool-call loop in the first
+    place.
+
+    Note: for the plain (blocking) move tools -- move_robot_to_position,
+    move_robot_linear, move_robot_to_position_safe, move_through_waypoints
+    -- tool calls within one chat turn still run one at a time, so calling
+    this while still waiting on one of *those* to return won't interrupt
+    it; use move_robot_queued instead when you need stop_robot to actually
+    work mid-motion. On the ROS2 backend, robot.stop() itself can only
+    cancel a trajectory goal still tracked as active in this same process.
 
     Returns:
-        A dict with ``status``, the robot's ``joints_deg``/``tcp_pose``/
-        ``robot_mode``/``safety_status`` right after the stop.
+        A dict with ``status``, ``cancelled_command_ids`` (queue entries
+        dropped by this call, may be empty), and the robot's
+        ``joints_deg``/``tcp_pose``/``robot_mode``/``safety_status`` right
+        after the stop.
     """
     # 1-3. No inputs to validate or units to convert -- stop takes none.
-    # 4. Execute, then report the resulting state.
+    # 4. Cancel the queue, stop the robot, then report the resulting state.
+    cancelled_ids = _queue.cancel_all()
     state = robot.stop()
     return {
         "status": "stopped",
+        "cancelled_command_ids": cancelled_ids,
         "joints_deg": {n: round(math.degrees(q), 1)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
         "tcp_pose": [round(v, 4) for v in state.tcp_pose],

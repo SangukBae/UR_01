@@ -369,6 +369,18 @@ class ROS2URClient:
             "(URScript movel) for move_robot_linear instead."
         )
 
+    def free_drive(self, duration_s: float) -> RobotState:
+        """Not implemented: free-drive is a URScript-level PolyScope
+        feature (``freedrive_mode()``); the ROS2 driver would need its own
+        ``freedrive_mode_controller`` activated via the controller manager
+        to do the equivalent, not wired up here. Raises so a caller gets a
+        clear, immediate reason instead of an AttributeError."""
+        raise NotImplementedError(
+            "free_drive needs the ROS2 driver's freedrive_mode_controller "
+            "activated -- not implemented in the ROS2 backend yet. Use "
+            "UR_BACKEND=socket (URScript freedrive_mode()) instead."
+        )
+
     def move_waypoints(
         self,
         waypoints: list[list[float]],

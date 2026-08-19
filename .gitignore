@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 *.log
+case1/waypoints.json
+case1/programs.json

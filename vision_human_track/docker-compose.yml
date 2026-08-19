@@ -1,0 +1,11 @@
+services:
+  vision-human-track:
+    build: .
+    container_name: ur01-vision-human-track
+    ports:
+      - "8000:8000"
+    # Uncomment to pass a local camera device through on native Linux.
+    # WSL2 needs the device attached via usbipd first - see README.
+    # devices:
+    #   - "/dev/video0:/dev/video0"
+    restart: unless-stopped
