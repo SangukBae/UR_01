@@ -133,6 +133,16 @@ Something else sent the robot a program (e.g. a raw script via
 ros2 service call /io_and_status_controller/resend_robot_program std_srvs/srv/Trigger "{}"
 ```
 
+## Vision Stack (human + hand detection via camera)
+
+```bash
+cd vision_human_track && source venv/bin/activate   # or: docker compose up -d --build
+python3 live_demo.py       # live GUI, needs a webcam + display
+```
+
+See [`vision_human_track/README.md`](vision_human_track/README.md) for the API
+(`/detect/live`, `/detect/image`), setup, and known gaps.
+
 ## Case 1 (MCP server)
 
 ```bash
