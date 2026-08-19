@@ -15,7 +15,9 @@ read + real motion) against the simulator.
 - [`llm_client/`](llm_client/) — a standalone LLM chat wrapper (natural
   language in, MCP tool calls to `case1/server.py` out), the team's
   Bronze-tier "LLM wrapper" deliverable reimplemented against this repo's
-  own server. See its own [README](llm_client/README.md).
+  own server. Also speaks: `--voice` swaps typed input for a live
+  microphone (verified end to end against a real mic over WSLg). See its
+  own [README](llm_client/README.md).
 
 ## Environment
 

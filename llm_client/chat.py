@@ -19,14 +19,22 @@ Setup:
 
 Run (from this folder, with the simulator up and the robot powered on):
     python3 chat.py
+
+Or speak instead of typing: each turn it listens, waits for you to start
+talking, records until you stop, transcribes, and sends that -- see
+voice.py for how, and its module docstring for the microphone/PulseAudio
+setup this needs beyond pip:
+    python3 chat.py --voice
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 from fastmcp import Client
 from openai import OpenAI
@@ -61,7 +69,13 @@ def _to_openai_tools(mcp_tools) -> list[dict]:
     ]
 
 
-async def main() -> None:
+async def main(get_input: Callable[[], str | None], hint: str) -> None:
+    """``get_input`` returns the next user message (or None/empty to skip a
+    turn, e.g. voice mode hearing nothing) -- ``input("You: ")`` for typed
+    chat, ``voice.listen()`` for ``--voice``. Everything past that point
+    (the LLM + tool-call loop) doesn't care which one produced the text.
+    ``hint`` is just the startup line telling you which one is active.
+    """
     api_key = os.environ.get(API_KEY_ENV)
     if not api_key:
         raise SystemExit(
@@ -82,15 +96,18 @@ async def main() -> None:
         mcp_tools = await mcp_client.list_tools()
         tools = _to_openai_tools(mcp_tools)
         print(f"Connected: {len(tools)} tools from ur-tools, model {MODEL} @ {BASE_URL}")
-        print("Type a message (e.g. 'move the robot home'), Ctrl-C to quit.\n")
+        print(f"{hint} Ctrl-C to quit.\n")
 
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         while True:
             try:
-                user_text = input("You: ").strip()
+                user_text = get_input()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
+            if not user_text:
+                continue
+            user_text = user_text.strip()
             if not user_text:
                 continue
             messages.append({"role": "user", "content": user_text})
@@ -122,5 +139,29 @@ async def main() -> None:
                     })
 
 
+def _text_input() -> str | None:
+    return input("You: ")
+
+
+def _voice_input() -> str | None:
+    import voice  # local import: numpy/faster-whisper are only needed here
+
+    text = voice.listen("\U0001F3A4 Listening -- speak your command...")
+    if text is None:
+        print("(didn't catch anything, try again)")
+        return None
+    print(f"You (heard): {text}")
+    return text
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--voice", action="store_true",
+        help="Speak commands into the microphone instead of typing them (see voice.py).",
+    )
+    args = parser.parse_args()
+    if args.voice:
+        asyncio.run(main(_voice_input, "Speaking mode -- each turn, just start talking."))
+    else:
+        asyncio.run(main(_text_input, "Type a message (e.g. 'move the robot home')."))

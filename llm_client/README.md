@@ -54,6 +54,68 @@ You: move the robot home
 Robot: Done -- the robot is now at its home position...
 ```
 
+## Voice input
+
+Speak instead of typing:
+
+```bash
+python3 chat.py --voice
+```
+
+Each turn it starts listening immediately, waits (quietly) for you to start
+talking, records until you stop, transcribes locally (no API key needed for
+this part), and sends that as your message -- same tool-calling loop either
+way, only how the text arrives differs. It also prints what it heard, since
+speech-to-text can mishear:
+
+```
+Connected: 7 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
+🎤 Listening -- speak your command...
+You (heard): move the robot home
+  -> move_robot_to_position({})
+Robot: Done -- the robot is now at its home position...
+```
+
+**Verified working end to end** against a real microphone: WSL2/WSLg
+bridges the Windows host's mic in as a PulseAudio source (`RDPSource`) --
+no extra setup, `$PULSE_SERVER` is already pointed at it. Confirmed live:
+speaking "move the robot home" into the mic was captured, transcribed, and
+correctly called `move_robot_to_position`.
+
+Needs `pulseaudio-utils` for `parec` (the capture tool; see `voice.py`'s
+docstring for why not `parecord`):
+
+```bash
+sudo apt install -y pulseaudio-utils
+pactl info                      # confirms $PULSE_SERVER is reachable
+pactl list short sources        # should list a real default source
+```
+
+If it's not WSL2/WSLg, this still works on any Linux with a working
+PulseAudio default source (a real laptop mic, typically) -- the code never
+hardcodes `RDPSource`, it just uses whatever `parec` picks up by default.
+
+**Not a wake word** -- there's no "hey robot" trigger, no continuous
+background listening. It's armed the moment `listen()` is called (each
+chat turn) and triggers on an energy threshold once you start talking. A
+real wake-word engine (Porcupine, openWakeWord) would run continuously in
+the background instead of needing a fresh `listen()` call per turn; that's
+its own model/dependency, not pulled in here.
+
+**Tuning, if it doesn't fit your mic/room** (env vars, see `voice.py` for
+defaults): `VOICE_START_RMS` (lower if it never triggers, raise if it
+triggers on room noise -- run with `VOICE_DEBUG=1` to watch live RMS
+values and pick a threshold between your room's noise floor and your
+speaking volume), `VOICE_SILENCE_HANG_S` (how long a pause before it
+decides you're done -- raise if it cuts you off mid-sentence),
+`VOICE_MAX_WAIT_S` / `VOICE_MAX_UTTERANCE_S` (give-up caps),
+`WHISPER_MODEL` (default `base.en`; `small.en` is more accurate and still
+CPU-fast if `base.en` mishears too often). A stray loud noise can
+occasionally get transcribed as a hallucinated phrase (a known Whisper
+quirk on noise/near-silence, not something this VAD filters out) -- if
+that happens a lot, raising `VOICE_START_RMS` past your room's noise floor
+is the fix.
+
 ## Other endpoints
 
 Default is Cerebras (`base_url=https://api.cerebras.ai/v1`,
