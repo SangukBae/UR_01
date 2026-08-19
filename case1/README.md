@@ -13,18 +13,49 @@ job is to add more tools of your own (a state reader, a linear move, a gripper),
 each following the same four-step shape, so a client can do more than move to a
 joint pose.
 
-The robot seam is **not** your job here: `ur_client.py` already speaks to the
-robot over sockets. Your work is the tool layer on top of it, especially the
-docstrings, because the model reads them to decide when and how to call a tool.
+**Status: all four tiers are implemented and verified** (`test_server.py` passes
+end to end against the PolyScope X simulator, on both robot backends below).
 
 ## What's provided vs what you build
 
-| File | Role | Provided? |
-|------|------|-----------|
-| `server.py` | the MCP server; `move_robot_to_position` (worked) + `example` (template) | worked tool + template, add your own |
-| `ur_client.py` | pure standard-library seam over the robot (motion + state) | done, do not touch |
-| `test_server.py` | in-process smoke test for both tools | provided |
-| `requirements.txt` | one dependency, the MCP framework | provided |
+| File | Role |
+|------|------|
+| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `example` (template) |
+| `ur_client.py` | socket seam over the robot (motion + state), `UR_BACKEND=socket` (default) |
+| `kinematics.py` | nominal UR10 forward kinematics, used only for the Diamond workspace-bounds safety check |
+| `test_server.py` | in-process smoke test for every tool above |
+| `requirements.txt` | one dependency, the MCP framework |
+| `../ros2_ur_driver/ros2_client.py` | ROS2 seam over the robot via `ros_humble_ur_robot_driver`, `UR_BACKEND=ros2` -- same `RobotState` shape and methods as `ur_client.py`, so `server.py`'s tools don't change either way |
+
+### Two robot backends
+
+`server.py` picks its backend from the `UR_BACKEND` env var:
+
+- `UR_BACKEND=socket` (default) -- direct TCP sockets to the controller
+  (`ur_client.py`). No ROS2 needed.
+- `UR_BACKEND=ros2` -- routes through `ros_humble_ur_robot_driver`
+  (`../ros2_ur_driver/ros2_client.py`), matching the team's target
+  architecture (MCP Server -> ROS2 -> UR Driver -> robot). Needs the driver
+  already launched -- see `../ros2_ur_driver/README.md` -- and `rclpy` on the
+  path (`source /opt/ros/humble/setup.bash`).
+
+**Don't mix them against the same live robot in one session.** The socket
+backend uploads a raw URScript program directly to the controller, which
+knocks out the "External Control" program the ROS2 driver depends on to keep
+its reverse-socket connection alive -- the driver's next trajectory goal then
+gets rejected with `Controller is not running`. Recover with:
+```bash
+ros2 service call /io_and_status_controller/resend_robot_program std_srvs/srv/Trigger "{}"
+```
+(This simulator's External Control connection has also been observed to drop
+on its own after a stretch of idle time, independent of that conflict --
+same fix.)
+
+**Sandbox note:** if `ros2 topic list` (or anything else `ros2`) hangs
+instead of returning, the default RMW (FastRTPS) may be stuck on multicast
+discovery in your environment. `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+(`sudo apt install ros-humble-rmw-cyclonedds-cpp` if not already installed)
+fixed it here.
 
 ## Setup
 
@@ -53,10 +84,11 @@ Cheapest checks first, then connect a client.
 python -c "from ur_client import URClient; r=URClient(); r.connect(); print(r.get_state())"
 ```
 
-**2. MCP tools in-process.** Exercises both tools, input validation, and real
+**2. MCP tools in-process.** Exercises every tool, input validation, and real
 motion, without an LLM or a subprocess:
 ```bash
-python test_server.py
+python test_server.py               # UR_BACKEND=socket (default)
+UR_BACKEND=ros2 python test_server.py  # against the ROS2 driver instead
 ```
 If the robot is off, both fail with a clear "not powered on" message. That error
 is the guard working.
@@ -80,7 +112,7 @@ server to it as an MCP named `ur-tools`. Two free paths:
   openclaw mcp add ur-tools \
     --command /PATH/TO/python3 \
     --arg "/PATH/TO/case 1/server.py"
-  openclaw mcp probe ur-tools     # expect 2 tools
+  openclaw mcp probe ur-tools     # expect 6 tools
   ```
 
 With either, open the chat and ask in plain language: `move the robot home.` The
@@ -101,17 +133,29 @@ command is `python3` and whose argument is the absolute path to `server.py`.
 
 ## Tiers
 
-- **Bronze, run it:** bring up the sim, connect a client, and move the robot home
-  with the provided `move_robot_to_position` tool.
-- **Silver, read state:** add a `get_robot_state` tool (copy `example`, follow the
-  four-step pattern) that returns joints, TCP pose, and mode, so an agent can
-  observe before it acts.
-- **Gold, richer motion:** add a more capable motion tool, a relative move, a
-  linear/TCP move, or a multi-waypoint path, with full input validation and limit
-  checks.
-- **Diamond, real skills:** add a gripper / IO tool or a compound skill (a
-  pick-and-place primitive), and surface `safety_status` so a client can detect a
-  protective stop.
+- **Bronze, run it -- done:** `move_robot_to_position`. Bring up the sim,
+  connect a client, and move the robot home.
+- **Silver, read state -- done:** `get_robot_state`. Returns joints (angle +
+  speed), TCP pose, mode, and safety status, so an agent can observe before it
+  acts.
+- **Gold, richer motion -- done:** `move_through_waypoints`. Blends through a
+  list of joint-space waypoints in one motion (no stop-and-restart at each
+  one) and returns a trace of states sampled while it moved, so an agent can
+  see the path it actually took. (MCP tool calls are request/response, not a
+  push channel, so this is a trace-after-the-fact rather than a live feed --
+  see the tool's docstring.)
+- **Diamond, real skills -- done:** `move_robot_to_position_safe` adds a
+  safety gate in front of a move -- joint limits, a speed cap, and a
+  forward-kinematics workspace-bounds check (`kinematics.py`, nominal DH, a
+  coarse estimate) -- and rejects an unsafe command before anything moves.
+  `set_gripper` opens/closes via digital IO. `safety_status` is surfaced by
+  `get_robot_state`.
+
+Next, not yet built: a linear/TCP-space move (needs either URScript `movel`
+for the socket backend, or IK for the ROS2 one, since
+`scaled_joint_trajectory_controller` is joint-space only), and a compound
+pick-and-place skill (needs the camera/perception piece from the team's wider
+architecture, out of scope for this file alone).
 
 ## The tool pattern
 
@@ -126,10 +170,25 @@ minimal template; copy it to start each new tool.
 
 ## Robot interface
 
-`ur_client.py` is the only file that touches the robot. It speaks two UR network
-interfaces over plain TCP sockets:
-- Primary interface (port 30001): motion. Uploads a small URScript `movej`.
-- RTDE (port 30004): state. Reads joint angles and TCP pose.
+Two interchangeable seams live behind the same `RobotState` shape and method
+names (`connect`, `get_state`, `move_joint`, `move_waypoints`, `set_gripper`);
+`server.py`'s tools call whichever one `UR_BACKEND` picked and don't otherwise
+care which it is.
 
-Keep tools calling `URClient` methods so the server stays portable between the
-simulator and a real robot. Only `UR_HOST` changes.
+- **`ur_client.py`** (`UR_BACKEND=socket`, default) -- plain TCP sockets, no
+  ROS2:
+  - Primary interface (port 30001): motion + gripper. Uploads small URScript
+    programs (`movej`, `set_digital_out`).
+  - RTDE (port 30004): state. Reads joint angles, joint velocities, TCP pose,
+    mode, safety status.
+- **`../ros2_ur_driver/ros2_client.py`** (`UR_BACKEND=ros2`) -- through
+  `ros_humble_ur_robot_driver`:
+  - `/scaled_joint_trajectory_controller/follow_joint_trajectory` (action):
+    motion.
+  - `/io_and_status_controller/set_io` (service): gripper.
+  - `/joint_states`, `/tcp_pose_broadcaster/pose`,
+    `/io_and_status_controller/{robot_mode,safety_mode}` (topics): state.
+
+Only `UR_HOST` (socket backend) changes to target a real robot instead of the
+simulator; the ROS2 backend instead points at whatever `robot_ip` the driver
+was launched with (see `../ros2_ur_driver/README.md`).

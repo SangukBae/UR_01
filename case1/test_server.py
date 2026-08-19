@@ -27,7 +27,11 @@ HOME_DEG = [0, -90, 0, -90, 0, 0]
 async def main() -> None:
     async with Client(mcp) as client:
         names = [t.name for t in await client.list_tools()]
-        assert set(names) == {"move_robot_to_position", "example"}, names
+        assert set(names) == {
+            "move_robot_to_position", "example",
+            "get_robot_state", "move_through_waypoints",
+            "move_robot_to_position_safe", "set_gripper",
+        }, names
         print("tools:", names)
 
         result = await client.call_tool("example", {})
@@ -52,6 +56,54 @@ async def main() -> None:
             print("bad input rejected:", str(exc).splitlines()[-1].strip())
         else:
             raise AssertionError("bad input was accepted")
+
+        await client.call_tool("move_robot_to_position", {})  # park home
+
+        # Silver: read state without moving.
+        state = await client.call_tool("get_robot_state", {})
+        assert state.data["robot_mode"] == 7, state.data
+        assert "safety_status" in state.data and "joint_speeds_deg_s" in state.data
+        print("get_robot_state:", state.data["joints_deg"])
+
+        # Gold: blended multi-waypoint move, with a trace of how it went.
+        path = await client.call_tool("move_through_waypoints", {
+            "waypoints_deg": [[20, -90, 0, -90, 0, 0], HOME_DEG],
+        })
+        assert path.data["status"] == "reached"
+        assert len(path.data["trace"]) >= 1
+        print("move_through_waypoints:", path.data["joints_deg"],
+              f"({len(path.data['trace'])} trace points)")
+
+        # Diamond: the safety-gated move succeeds for a reasonable target...
+        safe = await client.call_tool(
+            "move_robot_to_position_safe", {"joint_angles_deg": HOME_DEG})
+        assert safe.data["status"] == "reached"
+        print("move_robot_to_position_safe:", safe.data["joints_deg"])
+
+        # ...and rejects one before anything moves (speed past the safety cap).
+        try:
+            await client.call_tool("move_robot_to_position_safe", {
+                "joint_angles_deg": HOME_DEG, "speed": 999.0,
+            })
+        except Exception as exc:
+            print("unsafe speed rejected:", str(exc).splitlines()[-1].strip())
+        else:
+            raise AssertionError("unsafe speed was accepted")
+
+        # Diamond: gripper open/close.
+        closed = await client.call_tool("set_gripper", {"state": "close"})
+        assert closed.data["gripper"] == "CLOSE"
+        opened = await client.call_tool("set_gripper", {"state": "OPEN"})
+        assert opened.data["gripper"] == "OPEN"
+        print("set_gripper: close/open ok")
+
+        # Validation: an unknown gripper state must be rejected.
+        try:
+            await client.call_tool("set_gripper", {"state": "SIDEWAYS"})
+        except Exception as exc:
+            print("bad gripper state rejected:", str(exc).splitlines()[-1].strip())
+        else:
+            raise AssertionError("bad gripper state was accepted")
 
         await client.call_tool("move_robot_to_position", {})  # park home
     print("ALL PASSED")

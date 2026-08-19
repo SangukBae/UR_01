@@ -45,7 +45,9 @@ _RTDE_REQUEST_PROTOCOL_VERSION = 86  # 'V'
 _RTDE_SETUP_OUTPUTS = 79             # 'O'
 _RTDE_START = 83                     # 'S'
 _RTDE_DATA_PACKAGE = 85              # 'U'
-_RTDE_OUTPUTS = "actual_q,actual_TCP_pose,robot_mode,safety_status"
+_RTDE_OUTPUTS = "actual_q,actual_qd,actual_TCP_pose,robot_mode,safety_status"
+
+DIGITAL_OUT_GRIPPER_PIN = 0  # tool digital output 0, see ur_client.set_gripper
 
 
 @dataclass
@@ -53,6 +55,7 @@ class RobotState:
     """A single snapshot of the robot, read over RTDE."""
 
     q_rad: list[float]        # actual joint angles (radians), base..wrist3
+    qd_rad: list[float]       # actual joint velocities (rad/s), base..wrist3
     tcp_pose: list[float]     # actual TCP pose [x, y, z, rx, ry, rz] (m, rad)
     robot_mode: int           # 7 == RUNNING
     safety_status: int        # 1 == NORMAL
@@ -100,10 +103,12 @@ class URClient:
 
         off = 1  # first byte is the recipe id
         q = list(struct.unpack(">6d", body[off:off + 48])); off += 48
+        qd = list(struct.unpack(">6d", body[off:off + 48])); off += 48
         tcp = list(struct.unpack(">6d", body[off:off + 48])); off += 48
         mode = struct.unpack(">i", body[off:off + 4])[0]; off += 4
         safety = struct.unpack(">i", body[off:off + 4])[0]
-        return RobotState(q_rad=q, tcp_pose=tcp, robot_mode=mode, safety_status=safety)
+        return RobotState(
+            q_rad=q, qd_rad=qd, tcp_pose=tcp, robot_mode=mode, safety_status=safety)
 
     def get_joint_positions(self) -> list[float]:
         """Actual joint angles in radians, base..wrist3."""
@@ -158,6 +163,97 @@ class URClient:
             f"Robot did not reach the target within {timeout_s:.0f}s "
             "(still moving, blocked, or a protective stop?)."
         )
+
+    def move_waypoints(
+        self,
+        waypoints: list[list[float]],
+        speed: float,
+        acceleration: float,
+        *,
+        blend_radius: float = 0.05,
+        tol_rad: float = 0.01,
+        timeout_s: float = 40.0,
+        trace_interval_s: float = 0.3,
+    ) -> tuple[RobotState, list[RobotState]]:
+        """Move through several joint-space waypoints in one blended motion.
+
+        Every waypoint but the last gets ``blend_radius`` so the robot doesn't
+        stop at each one (URScript's ``movej ... r=``); the last is approached
+        exactly. Polls state throughout so the caller gets a trace of the move
+        as it happened, not just the final pose (there is no live push channel
+        to an MCP client mid-call, so this is the closest a synchronous tool
+        result gets to "watch it happen").
+
+        Returns:
+            ``(final_state, trace)`` -- the state on arrival, and every state
+            snapshot polled while waiting.
+
+        Raises:
+            RuntimeError: The robot is not in RUNNING mode.
+            TimeoutError: The last waypoint wasn't reached within ``timeout_s``.
+        """
+        state = self.get_state()
+        if state.robot_mode != ROBOT_MODE_RUNNING:
+            raise RuntimeError(
+                f"Robot is not powered on (mode {state.robot_mode}, need "
+                f"{ROBOT_MODE_RUNNING}=RUNNING). Open http://localhost and power "
+                "the robot on + release brakes, then try again."
+            )
+
+        lines = ["def move_path():"]
+        for i, wp in enumerate(waypoints):
+            joints = ", ".join(f"{v:.6f}" for v in wp)
+            r = 0.0 if i == len(waypoints) - 1 else blend_radius
+            lines.append(f"  movej([{joints}], a={acceleration:.4f}, v={speed:.4f}, r={r:.4f})")
+        lines.append("end")
+        script = "\n".join(lines) + "\n"
+
+        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
+            s.sendall(script.encode())
+
+        target = waypoints[-1]
+        trace: list[RobotState] = []
+        deadline = time.monotonic() + timeout_s
+        last_poll = 0.0
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            state = self.get_state()
+            if time.monotonic() - last_poll >= trace_interval_s:
+                trace.append(state)
+                last_poll = time.monotonic()
+            if max(abs(a - b) for a, b in zip(state.q_rad, target)) <= tol_rad:
+                return state, trace
+        raise TimeoutError(
+            f"Robot did not reach the last waypoint within {timeout_s:.0f}s "
+            "(still moving, blocked, or a protective stop?)."
+        )
+
+    # --- Tool IO ---------------------------------------------------------- #
+    def set_gripper(self, closed: bool) -> RobotState:
+        """Set tool digital output 0 (the convention this rig's gripper is
+        wired to) ON to close, OFF to open, and report the resulting state.
+
+        This is a fire-and-forget digital signal -- there's no RTDE feedback
+        signal wired up in this recipe to confirm the gripper physically
+        reached that position, only that the command was sent.
+        """
+        state = self.get_state()
+        if state.robot_mode != ROBOT_MODE_RUNNING:
+            raise RuntimeError(
+                f"Robot is not powered on (mode {state.robot_mode}, need "
+                f"{ROBOT_MODE_RUNNING}=RUNNING). Open http://localhost and power "
+                "the robot on + release brakes, then try again."
+            )
+        value = "True" if closed else "False"
+        script = (
+            "def set_gripper():\n"
+            f"  set_digital_out({DIGITAL_OUT_GRIPPER_PIN}, {value})\n"
+            "end\n"
+        )
+        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
+            s.sendall(script.encode())
+        time.sleep(0.5)  # let the signal land before reporting state
+        return self.get_state()
 
     # --- RTDE framing helpers ------------------------------------------- #
     @staticmethod
