@@ -114,33 +114,38 @@ is the guard working.
 to a port. A sanity run (`python3 server.py`) only checks it imports and reaches
 the robot; there is nothing to connect to there.
 
-Set up a free LLM client with [`../llm-client`](../llm-client), then add this
-server to it as an MCP named `ur-tools`. Two free paths:
+**Recommended: [`../llm_client/`](../llm_client/)**, a standalone chat script
+built and verified in this repo -- type or speak, an LLM (Cerebras, free)
+picks the tool to call, the robot moves:
+```bash
+cd ../llm_client
+pip install -r requirements.txt
+export CEREBRAS_API_KEY="..."   # never in a file -- see its README
+python3 chat.py            # type commands
+python3 chat.py --voice    # or speak them
+```
+See [`../llm_client/README.md`](../llm_client/README.md) for the full
+setup (including voice mode and other endpoints).
 
-- **Option A, self-hosted (Bionic, local).** Follow
-  [`../llm-client/self-hosted.md`](../llm-client/self-hosted.md). In its "Add an
-  MCP server" step, use Name `ur-tools`, Command the absolute path to your
-  `python3`, and one Argument: the absolute path to `case 1/server.py`.
-- **Option B, cloud-hosted (OpenClaw).** Follow
-  [`../llm-client/cloud-hosted.md`](../llm-client/cloud-hosted.md), then register
-  the server:
-  ```bash
-  openclaw mcp add ur-tools \
-    --command /PATH/TO/python3 \
-    --arg "/PATH/TO/case 1/server.py"
-  openclaw mcp probe ur-tools     # expect 6 tools
-  ```
+**Alternative: a GUI MCP client.** The course's own guides
+([`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md)
+for Bionic,
+[`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)
+for OpenClaw, in the course repo, not duplicated here) walk through adding
+this server to a chat app instead: MCP entry name `ur-tools`, command the
+absolute path to your `python3`, one argument the absolute path to this
+folder's `server.py` (e.g. `/PATH/TO/UR_01/case1/server.py`). Expect 7
+tools on probe/connect.
 
-With either, open the chat and ask in plain language: `move the robot home.` The
-model reads the tool docstrings, calls `move_robot_to_position`, and the robot
+With any of these, ask in plain language: `move the robot home.` The model
+reads the tool docstrings, calls `move_robot_to_position`, and the robot
 moves.
 
 ### Using Claude Code (paid, optional)
 
-If you already have Claude Code, register the server directly (absolute path,
-quoted because of the space):
+If you already have Claude Code, register the server directly:
 ```bash
-claude mcp add ur-tools -- python3 "/PATH/TO/essre2026-cases/case 1/server.py"
+claude mcp add ur-tools -- python3 /PATH/TO/UR_01/case1/server.py
 claude mcp list        # check it is connected
 ```
 Then ask `Move the robot home.`; remove it with `claude mcp remove ur-tools`.
