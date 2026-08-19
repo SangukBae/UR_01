@@ -1,23 +1,13 @@
 # UR_01 — UR10 Robotics Summer School: Case 1 + ROS2 Driver Integration
 
-Work from the UR Robotics Summer School 2026 (Universal Robots UR10, PolyScope X
-simulator): the Case 1 MCP server (Bronze → Diamond tiers, all implemented and
-verified) plus a working ROS2 ↔ UR10 integration verified end-to-end (state
-read + real motion) against the simulator.
+UR Robotics Summer School 2026 (UR10, PolyScope X simulator): Case 1 MCP
+server + ROS2 ↔ UR10 integration, both verified end-to-end against the sim.
 
-- [`case1/`](case1/) — MCP server exposing UR10 tools to an LLM
-  (`server.py`, `ur_client.py`, `kinematics.py`, `test_server.py`), with an
-  interchangeable ROS2 backend (`../ros2_ur_driver/ros2_client.py`). See its
-  own [README](case1/README.md) for the tier ladder (Bronze → Diamond).
-- [`ros2_ur_driver/`](ros2_ur_driver/) — `ros-humble-ur-robot-driver`
-  connected to the simulator, with the two blockers that stop the robot
-  from moving and how to get past them.
-- [`llm_client/`](llm_client/) — a standalone LLM chat wrapper (natural
-  language in, MCP tool calls to `case1/server.py` out), the team's
-  Bronze-tier "LLM wrapper" deliverable reimplemented against this repo's
-  own server. Also speaks: `--voice` swaps typed input for a live
-  microphone (verified end to end against a real mic over WSLg). See its
-  own [README](llm_client/README.md).
+- [`case1/`](case1/) — MCP server, Bronze → Diamond, socket + ROS2 backends.
+- [`ros2_ur_driver/`](ros2_ur_driver/) — `ros-humble-ur-robot-driver` against
+  the simulator.
+- [`llm_client/`](llm_client/) — standalone chat wrapper (text + `--voice`),
+  Cerebras by default, MCP tool-calling into `case1/server.py`.
 
 ## Environment
 
@@ -46,23 +36,11 @@ docker ps                     # confirm essre-ursim-psx is Up
 Open `http://localhost` in a browser:
 
 1. Power the robot on and release the brakes until it reads **RUNNING**.
-2. (Optional) Go to **Settings → Password** if you need the panel for
-   something else. Default passwords: Admin = `easybot`, Operational Mode =
-   `operator` (you'll be forced to change these on first use). Selecting
-   **Manual** Operational Mode forces **Remote Control** back to `Local` (a
-   safety interlock -- Manual assumes a human is directly in control).
-
-   **Neither setting needs to be touched for this repo.** Earlier notes
-   here said the ROS2 driver required Remote Control = `Remote` and
-   Operational Mode = `Automatic`, or motion commands would be silently
-   ignored. Tested directly against this simulator and that turned out
-   wrong: with Operational Mode on `Manual` (so Remote Control forced to
-   `Local`), both `case1/ur_client.py`'s socket backend and the ROS2 driver
-   (`ros2_ur_driver/`) moved the robot exactly on target -- see
-   [`ros2_ur_driver/README.md`](ros2_ur_driver/README.md) for the specifics
-   of that test. Take it as this-simulator-verified, not a general
-   PolyScope X claim; real hardware or a different safety configuration
-   may enforce it for real.
+2. Remote Control / Operational Mode (Settings → Password, `easybot` /
+   `operator`): neither needs touching. Verified both backends move the
+   robot fine with Operational Mode on `Manual` (which forces Remote
+   Control to `Local`) -- this-simulator-verified, not a general PolyScope
+   X claim. Details in [`ros2_ur_driver/README.md`](ros2_ur_driver/README.md).
 
 Verify state is readable (from `case1/`):
 
@@ -113,12 +91,9 @@ this repo is the output for this simulator image.)
 
 ## 5. Launch the driver
 
-`reverse_ip` **must** be set explicitly to `host.docker.internal` — the
-simulator runs in a Docker container, so if this is left to auto-detect it
-resolves to `127.0.0.1`, which inside the container means the container
-itself, not your WSL2 host. Without this the robot shows a
-"Trajectory/Script command/Reverse socket connected: False" popup and never
-moves.
+`reverse_ip` **must** be `host.docker.internal`, not auto-detected --
+otherwise it resolves to the sim container itself instead of the WSL2
+host, and the robot never connects.
 
 ```bash
 ros2 launch ur_robot_driver ur10.launch.py \
@@ -166,8 +141,5 @@ claude mcp add ur-tools -- python3 "$(pwd)/server.py"
 claude mcp list
 ```
 
-See [`case1/README.md`](case1/README.md) for the Bronze → Diamond tiers.
-**Status: all four tiers implemented and verified** against the PolyScope X
-simulator — `move_robot_to_position` (Bronze), `get_robot_state` (Silver),
-`move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper`
-(Diamond). `test_server.py` passes end to end (`ALL PASSED`).
+All four tiers (Bronze → Diamond) implemented and verified -- see
+[`case1/README.md`](case1/README.md).

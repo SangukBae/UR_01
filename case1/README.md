@@ -1,20 +1,11 @@
 # Case 1: MCP Server for Robot Tools
 
-An MCP server that exposes UR robot capabilities as tools an LLM can call, so an
-agent can operate the robot in natural language. It is the robot's "hands": any
-MCP client (Claude Code, Cursor, or the Case 3 agent) launches this server and
-calls its tools.
-
-## The task
-
-Turn robot capabilities into well-described, LLM-callable tools. One tool ships
-fully worked, `move_robot_to_position`, and it moves the robot end to end. Your
-job is to add more tools of your own (a state reader, a linear move, a gripper),
-each following the same four-step shape, so a client can do more than move to a
-joint pose.
-
-**Status: all four tiers are implemented and verified** (`test_server.py` passes
-end to end against the PolyScope X simulator, on both robot backends below).
+MCP server exposing UR robot capabilities as LLM-callable tools -- any MCP
+client (Claude Code, Cursor, Case 3 agent) launches it and calls its tools.
+Four-step tool shape (validate → convert units → check limits → execute),
+each following `move_robot_to_position`. **Status: all four tiers
+implemented and verified** (`test_server.py` passes end to end, both
+backends).
 
 ## What's provided vs what you build
 
@@ -39,39 +30,24 @@ end to end against the PolyScope X simulator, on both robot backends below).
   already launched -- see `../ros2_ur_driver/README.md` -- and `rclpy` on the
   path (`source /opt/ros/humble/setup.bash`).
 
-**Don't mix them against the same live robot in one session.** The socket
-backend uploads a raw URScript program directly to the controller, which
-knocks out the "External Control" program the ROS2 driver depends on to keep
-its reverse-socket connection alive -- the driver's next trajectory goal then
-gets rejected with `Controller is not running`. Recover with:
+**Don't mix backends against the same live robot in one session** -- the
+socket backend's raw URScript upload knocks out the ROS2 driver's External
+Control program (`Controller is not running` on its next goal). Recover:
 ```bash
 ros2 service call /io_and_status_controller/resend_robot_program std_srvs/srv/Trigger "{}"
 ```
-(This simulator's External Control connection has also been observed to drop
-on its own after a stretch of idle time, independent of that conflict --
-same fix.)
+Also fixes External Control dropping on its own after idle.
 
-**Sandbox note:** if `ros2 topic list` (or anything else `ros2`) hangs
-instead of returning, the default RMW (FastRTPS) may be stuck on multicast
-discovery in your environment. `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
-(`sudo apt install ros-humble-rmw-cyclonedds-cpp` if not already installed)
-fixed it here.
+**RMW hang:** if any `ros2` command hangs, `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+(`sudo apt install ros-humble-rmw-cyclonedds-cpp`).
 
-**Don't call `move_robot_linear` from a singularity.** A Cartesian move needs
-near-infinite joint speed to track a straight line through a singular pose,
-which trips a **protective stop** (`safety_status` 3) on the real
-controller -- reproduced twice while building this tool: `HOME_DEG`
-(`[0, -90, 0, -90, 0, 0]`, wrist2 = 0deg -- wrist1/wrist3 axes align), and
-even a pose picked specifically to avoid that
-(`[20, -90, 30, -90, 60, 0]`, a *different*, shoulder-adjacent singularity
-that wasn't obvious from the joint values alone). `test_server.py` uses
-`[30, -100, 40, -80, 70, 10]`, verified clean over repeated round-trip
-`movel` calls. Moral: don't assume a pose is safe for a linear move just
-because it looks unremarkable -- verify it the same way, a few round trips,
-before relying on it. Recover a stopped robot from the PolyScope X UI
-(there's no dashboard-server text protocol on this simulator to unlock it
-from code); this simulator has also been observed to self-clear a
-protective stop after a few seconds on its own.
+**Singularities break `move_robot_linear`:** a Cartesian move through one
+needs near-infinite joint speed → protective stop (`safety_status` 3).
+Reproduced at `HOME_DEG` (wrist2=0°) and even a pose picked to avoid that
+(a different, non-obvious singularity). `test_server.py`'s pose
+(`[30, -100, 40, -80, 70, 10]`) is verified clean -- don't assume a new
+pose is safe without the same check. No dashboard-server protocol on this
+sim to unlock a stop from code; it also self-clears after a few seconds.
 
 ## Setup
 
@@ -109,48 +85,31 @@ UR_BACKEND=ros2 python test_server.py  # against the ROS2 driver instead
 If the robot is off, both fail with a clear "not powered on" message. That error
 is the guard working.
 
-**3. Connect a client.** The server speaks MCP over stdio: the client launches
-`server.py` and talks to it over stdin/stdout, so you do not start it and connect
-to a port. A sanity run (`python3 server.py`) only checks it imports and reaches
-the robot; there is nothing to connect to there.
+**3. Connect a client.** Server speaks MCP over stdio -- the client launches
+`server.py`, no port to connect to.
 
-**Recommended: [`../llm_client/`](../llm_client/)**, a standalone chat script
-built and verified in this repo -- type or speak, an LLM (Cerebras, free)
-picks the tool to call, the robot moves:
+Recommended: [`../llm_client/`](../llm_client/) (text or `--voice`, Cerebras
+by default, this repo's own):
 ```bash
-cd ../llm_client
-pip install -r requirements.txt
-export CEREBRAS_API_KEY="..."   # never in a file -- see its README
-python3 chat.py            # type commands
-python3 chat.py --voice    # or speak them
+cd ../llm_client && pip install -r requirements.txt
+export CEREBRAS_API_KEY="..."   # never in a file
+python3 chat.py            # or --voice
 ```
-See [`../llm_client/README.md`](../llm_client/README.md) for the full
-setup (including voice mode and other endpoints).
 
-**Alternative: a GUI MCP client.** The course's own guides
-([`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md)
-for Bionic,
-[`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)
-for OpenClaw, in the course repo, not duplicated here) walk through adding
-this server to a chat app instead: MCP entry name `ur-tools`, command the
-absolute path to your `python3`, one argument the absolute path to this
-folder's `server.py` (e.g. `/PATH/TO/UR_01/case1/server.py`). Expect 7
-tools on probe/connect.
-
-With any of these, ask in plain language: `move the robot home.` The model
-reads the tool docstrings, calls `move_robot_to_position`, and the robot
-moves.
-
-### Using Claude Code (paid, optional)
-
-If you already have Claude Code, register the server directly:
+Claude Code:
 ```bash
 claude mcp add ur-tools -- python3 /PATH/TO/UR_01/case1/server.py
-claude mcp list        # check it is connected
+claude mcp list
 ```
-Then ask `Move the robot home.`; remove it with `claude mcp remove ur-tools`.
-Other clients (Cursor, Claude Desktop) use the same idea: an MCP entry whose
-command is `python3` and whose argument is the absolute path to `server.py`.
+
+GUI clients (Bionic, OpenClaw, Cursor, Claude Desktop): MCP entry, command
+`python3`, arg the absolute path to `server.py` (7 tools on probe). Course
+guides for Bionic/OpenClaw:
+[`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md),
+[`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)
+(course repo, not duplicated here).
+
+Any of these: `move the robot home.`
 
 ## Tiers
 
@@ -162,31 +121,20 @@ command is `python3` and whose argument is the absolute path to `server.py`.
   `movel`, `UR_BACKEND=socket` only -- the ROS2 backend raises
   `NotImplementedError`, since `scaled_joint_trajectory_controller` is
   joint-space only and needs IK to accept a Cartesian target).
-- **Gold, richer motion -- done:** `move_through_waypoints`. Blends through a
-  list of joint-space waypoints in one motion (no stop-and-restart at each
-  one) and **streams state live** via MCP progress notifications
-  (`notifications/progress`) as it moves -- a real push channel, not a
-  trace-after-the-fact: a client watching progress sees each polled state as
-  soon as it's captured, seconds before the tool call returns (verified in
-  `test_server.py` by timestamping each notification against the call's own
-  duration). The final result also includes the full `trace`, for a client
-  that isn't watching progress. Runs the blocking move in a worker thread
-  (`asyncio.to_thread`) so the event loop stays free to actually flush each
-  notification as it happens, instead of queuing them all up behind the
-  blocking socket/poll loop.
+- **Gold, richer motion -- done:** `move_through_waypoints`. Blends a
+  joint-space waypoint list into one motion, **streams state live** via MCP
+  progress notifications as it moves (real push channel; `test_server.py`
+  verifies notifications land before the call returns), and also returns
+  the full `trace` for clients not watching progress. Blocking move runs in
+  `asyncio.to_thread` so the loop stays free to flush notifications as they
+  happen.
 
-  Finding this also caught a real bug: the socket backend gets no
-  completion signal from the controller for a `movej` program, so it polls
-  and guesses "arrived" by proximity to the *last* waypoint. For a path
-  that loops back near its own start (e.g. out-and-back), that check could
-  pass on the very first poll -- before the robot had moved at all --
-  while the uploaded URScript kept running for real underneath (reproduced
-  while adding the streaming hook: a 3-waypoint round trip "completed" in
-  0.14s client-side while the controller's own program log showed it ran
-  ~1.3s). Fixed with a minimum-duration floor (`_estimate_path_duration`,
-  a trapezoidal-profile estimate summed per segment, mirroring the
-  ros2_client.py backend's own per-segment goal timing) that the tolerance
-  check can't satisfy early.
+  Bug caught building this: no completion signal from the controller for a
+  `movej` program, so arrival was guessed by proximity to the last
+  waypoint -- false-positived instantly on a path looping back near its
+  start, while the URScript kept running for real underneath. Fixed with a
+  minimum-duration floor (`_estimate_path_duration`, trapezoidal estimate
+  per segment).
 - **Diamond, real skills -- done:** `move_robot_to_position_safe` adds a
   safety gate in front of a move -- joint limits, a speed cap, and a
   forward-kinematics workspace-bounds check (`kinematics.py`, nominal DH, a

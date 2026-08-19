@@ -1,10 +1,8 @@
 # ROS2 ↔ UR10 (PolyScope X) Driver Integration
 
-Notes from getting `ros-humble-ur-robot-driver` talking to the PolyScope X
-(URSim) simulator from `simulation environment/` in a Docker Desktop + WSL2
-setup, including the non-obvious blocker that stops the robot from actually
-moving (a second one this file used to list turned out not to be one --
-see the correction below).
+`ros-humble-ur-robot-driver` against the PolyScope X (URSim) simulator,
+Docker Desktop + WSL2. One real blocker below (`reverse_ip`); Remote
+Control mode is not one, despite what this file used to say.
 
 ## What's here
 
@@ -35,35 +33,18 @@ background daemon that was already started under the wrong RMW.
 
 ## The one real blocker (WSL2 + Docker Desktop specific)
 
-**Correction:** this section used to list Remote Control mode as a required
-setup step ("PolyScope X refuses external control until switched from
-`Local` to `Remote`, and Operational Mode set to `Automatic`"). Tested
-directly against this simulator and that's not true here: with Operational
-Mode set to `Manual` (Remote Control forced to `Local` by that -- a safety
-interlock, since Manual assumes a human is directly in control), the driver
-still logged `Robot connected to reverse interface. Ready to receive
-control commands.` on launch, and a `move_joint` through it landed exactly
-on target (`[30, -80, 20, -100, 20, 10]` deg, all six joints). Same result
-for `case1/ur_client.py`'s socket backend. Neither backend needs Remote
-Control on this simulator -- Local/Manual is enough for both. (Password
-defaults if you do need the panel for something else: Admin = `easybot`,
-Operational Mode = `operator`, you'll be forced to change these on first
-use.) Take this as this-simulator-verified, not a general PolyScope X
-claim -- a real robot or a different safety configuration may enforce it
-for real.
+Remote Control / Operational Mode (Settings, `easybot` / `operator`)
+doesn't need touching -- verified with Operational Mode on `Manual`
+(Remote Control forced to `Local`): driver still logged `Robot connected
+to reverse interface`, `move_joint` landed exactly on target, same for the
+socket backend. This-simulator-verified, not a general PolyScope X claim.
 
-1. **`reverse_ip` must not be `127.0.0.1`.** The simulator runs inside a
-   Docker container; the driver runs on the WSL2 host. If you launch with
-   only `robot_ip:=127.0.0.1`, the driver auto-detects its own address as
-   `127.0.0.1` too — which, from *inside the container*, means the
-   container itself, not the host. The robot then can't connect back for
-   the reverse/trajectory/script-command sockets, and PolyScope X shows:
-   `Error connecting to remote: Trajectory socket(50003) connected: False /
-   Script command socket(50005) connected: False / Reverse socket (50001)
-   connected: False`.
-   Fix: pass `reverse_ip:=host.docker.internal` explicitly (the compose
-   file already maps that hostname via `extra_hosts: host.docker.internal:
-   host-gateway`).
+1. **`reverse_ip` must not be `127.0.0.1`.** Sim's in a container, driver's
+   on the WSL2 host -- auto-detect resolves to the container itself, not
+   the host, so the reverse/trajectory/script-command sockets never
+   connect (PolyScope X: `Trajectory/Script command/Reverse socket
+   connected: False`). Fix: `reverse_ip:=host.docker.internal` (compose
+   file already maps it via `extra_hosts`).
 
 Full command sequence is in the top-level [`README.md`](../README.md). With
 the RMW note above folded in:
@@ -83,14 +64,9 @@ commands.` before pointing `ros2_client.py` (or `case1/server.py` with
 
 ## If a trajectory goal gets rejected ("Controller is not running")
 
-Something else sent the robot a raw program directly (e.g. `case1/ur_client.py`
-in `UR_BACKEND=socket` mode, or anything else uploading URScript to port
-30001) and knocked out the driver's "External Control" program, which the
-ROS2 controller needs to stay active. This simulator's reverse-interface
-connection has also been observed to drop on its own after an idle stretch,
-independent of that conflict. Same fix either way:
+Something (e.g. `case1/ur_client.py` socket backend) knocked out External
+Control, or it dropped on its own after idle. Either way:
 ```bash
 ros2 service call /io_and_status_controller/resend_robot_program std_srvs/srv/Trigger "{}"
 ```
-Watch the driver's log for `Robot connected to reverse interface.` before
-retrying the goal.
+Wait for `Robot connected to reverse interface.` before retrying.
