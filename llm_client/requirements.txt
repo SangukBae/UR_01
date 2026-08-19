@@ -1,0 +1,4 @@
+# LLM chat wrapper: an OpenAI-compatible client (Cerebras et al.) + the same
+# MCP framework case1/server.py uses, to connect to it in-process.
+openai>=1.0
+fastmcp>=2.0

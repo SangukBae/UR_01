@@ -164,6 +164,58 @@ class URClient:
             "(still moving, blocked, or a protective stop?)."
         )
 
+    def move_linear(
+        self,
+        pose: list[float],
+        speed: float,
+        acceleration: float,
+        *,
+        tol_m: float = 0.005,
+        tol_rad: float = 0.01,
+        timeout_s: float = 20.0,
+    ) -> RobotState:
+        """TCP-space move in a straight line to an absolute pose ``pose``
+        (``[x, y, z, rx, ry, rz]``, metres + rotation-vector radians, base
+        frame), then block until the robot arrives (or ``timeout_s`` elapses).
+
+        Unlike ``move_joint`` (URScript ``movej``, curved joint-space path),
+        this uses URScript ``movel``, which interpolates the TCP itself in a
+        straight line -- the joints take whatever path keeps the TCP linear.
+
+        Raises:
+            RuntimeError: The robot is not in RUNNING mode.
+            TimeoutError: The robot did not reach ``pose`` within ``timeout_s``.
+        """
+        state = self.get_state()
+        if state.robot_mode != ROBOT_MODE_RUNNING:
+            raise RuntimeError(
+                f"Robot is not powered on (mode {state.robot_mode}, need "
+                f"{ROBOT_MODE_RUNNING}=RUNNING). Open http://localhost and power "
+                "the robot on + release brakes, then try again."
+            )
+
+        pose_str = ", ".join(f"{v:.6f}" for v in pose)
+        script = (
+            "def move_lin():\n"
+            f"  movel(p[{pose_str}], a={acceleration:.4f}, v={speed:.4f})\n"
+            "end\n"
+        )
+        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
+            s.sendall(script.encode())
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            state = self.get_state()
+            pos_ok = max(abs(a - b) for a, b in zip(state.tcp_pose[:3], pose[:3])) <= tol_m
+            rot_ok = max(abs(a - b) for a, b in zip(state.tcp_pose[3:], pose[3:])) <= tol_rad
+            if pos_ok and rot_ok:
+                return state
+        raise TimeoutError(
+            f"Robot did not reach the target pose within {timeout_s:.0f}s "
+            "(still moving, blocked, unreachable, or a protective stop?)."
+        )
+
     def move_waypoints(
         self,
         waypoints: list[list[float]],

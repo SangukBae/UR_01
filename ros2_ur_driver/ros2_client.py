@@ -323,6 +323,25 @@ class ROS2URClient:
             )
         return final
 
+    def move_linear(
+        self,
+        pose: list[float],
+        speed: float,
+        acceleration: float,
+        **kwargs,
+    ) -> RobotState:
+        """Not implemented: TCP-space linear moves need inverse kinematics,
+        since scaled_joint_trajectory_controller only accepts joint-space
+        goals (unlike the socket backend's URScript ``movel``, which does the
+        Cartesian interpolation on the controller itself). Raises so a caller
+        gets a clear, immediate reason instead of an AttributeError."""
+        raise NotImplementedError(
+            "move_linear needs inverse kinematics for "
+            "scaled_joint_trajectory_controller (joint-space only) -- not "
+            "implemented in the ROS2 backend yet. Use UR_BACKEND=socket "
+            "(URScript movel) for move_robot_linear instead."
+        )
+
     def move_waypoints(
         self,
         waypoints: list[list[float]],

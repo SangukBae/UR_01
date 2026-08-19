@@ -20,7 +20,7 @@ end to end against the PolyScope X simulator, on both robot backends below).
 
 | File | Role |
 |------|------|
-| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `example` (template) |
+| `server.py` | the MCP server: `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `example` (template) |
 | `ur_client.py` | socket seam over the robot (motion + state), `UR_BACKEND=socket` (default) |
 | `kinematics.py` | nominal UR10 forward kinematics, used only for the Diamond workspace-bounds safety check |
 | `test_server.py` | in-process smoke test for every tool above |
@@ -56,6 +56,22 @@ instead of returning, the default RMW (FastRTPS) may be stuck on multicast
 discovery in your environment. `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
 (`sudo apt install ros-humble-rmw-cyclonedds-cpp` if not already installed)
 fixed it here.
+
+**Don't call `move_robot_linear` from a singularity.** A Cartesian move needs
+near-infinite joint speed to track a straight line through a singular pose,
+which trips a **protective stop** (`safety_status` 3) on the real
+controller -- reproduced twice while building this tool: `HOME_DEG`
+(`[0, -90, 0, -90, 0, 0]`, wrist2 = 0deg -- wrist1/wrist3 axes align), and
+even a pose picked specifically to avoid that
+(`[20, -90, 30, -90, 60, 0]`, a *different*, shoulder-adjacent singularity
+that wasn't obvious from the joint values alone). `test_server.py` uses
+`[30, -100, 40, -80, 70, 10]`, verified clean over repeated round-trip
+`movel` calls. Moral: don't assume a pose is safe for a linear move just
+because it looks unremarkable -- verify it the same way, a few round trips,
+before relying on it. Recover a stopped robot from the PolyScope X UI
+(there's no dashboard-server text protocol on this simulator to unlock it
+from code); this simulator has also been observed to self-clear a
+protective stop after a few seconds on its own.
 
 ## Setup
 
@@ -137,7 +153,10 @@ command is `python3` and whose argument is the absolute path to `server.py`.
   connect a client, and move the robot home.
 - **Silver, read state -- done:** `get_robot_state`. Returns joints (angle +
   speed), TCP pose, mode, and safety status, so an agent can observe before it
-  acts.
+  acts. `move_robot_linear` adds a TCP-space straight-line move (URScript
+  `movel`, `UR_BACKEND=socket` only -- the ROS2 backend raises
+  `NotImplementedError`, since `scaled_joint_trajectory_controller` is
+  joint-space only and needs IK to accept a Cartesian target).
 - **Gold, richer motion -- done:** `move_through_waypoints`. Blends through a
   list of joint-space waypoints in one motion (no stop-and-restart at each
   one) and returns a trace of states sampled while it moved, so an agent can
@@ -151,9 +170,8 @@ command is `python3` and whose argument is the absolute path to `server.py`.
   `set_gripper` opens/closes via digital IO. `safety_status` is surfaced by
   `get_robot_state`.
 
-Next, not yet built: a linear/TCP-space move (needs either URScript `movel`
-for the socket backend, or IK for the ROS2 one, since
-`scaled_joint_trajectory_controller` is joint-space only), and a compound
+Next, not yet built: inverse kinematics for the ROS2 backend, so
+`move_robot_linear` works there too (currently socket-only), and a compound
 pick-and-place skill (needs the camera/perception piece from the team's wider
 architecture, out of scope for this file alone).
 
@@ -171,14 +189,15 @@ minimal template; copy it to start each new tool.
 ## Robot interface
 
 Two interchangeable seams live behind the same `RobotState` shape and method
-names (`connect`, `get_state`, `move_joint`, `move_waypoints`, `set_gripper`);
-`server.py`'s tools call whichever one `UR_BACKEND` picked and don't otherwise
-care which it is.
+names (`connect`, `get_state`, `move_joint`, `move_linear`, `move_waypoints`,
+`set_gripper`); `server.py`'s tools call whichever one `UR_BACKEND` picked and
+don't otherwise care which it is -- except `move_linear`, which the ROS2 seam
+implements only as a `NotImplementedError` (see Tiers above).
 
 - **`ur_client.py`** (`UR_BACKEND=socket`, default) -- plain TCP sockets, no
   ROS2:
   - Primary interface (port 30001): motion + gripper. Uploads small URScript
-    programs (`movej`, `set_digital_out`).
+    programs (`movej`, `movel`, `set_digital_out`).
   - RTDE (port 30004): state. Reads joint angles, joint velocities, TCP pose,
     mode, safety status.
 - **`../ros2_ur_driver/ros2_client.py`** (`UR_BACKEND=ros2`) -- through

@@ -12,6 +12,10 @@ read + real motion) against the simulator.
 - [`ros2_ur_driver/`](ros2_ur_driver/) — `ros-humble-ur-robot-driver`
   connected to the simulator, with the two blockers that stop the robot
   from moving and how to get past them.
+- [`llm_client/`](llm_client/) — a standalone LLM chat wrapper (natural
+  language in, MCP tool calls to `case1/server.py` out), the team's
+  Bronze-tier "LLM wrapper" deliverable reimplemented against this repo's
+  own server. See its own [README](llm_client/README.md).
 
 ## Environment
 

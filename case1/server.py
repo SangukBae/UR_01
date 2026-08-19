@@ -17,6 +17,8 @@ Tools, by tier:
   * Bronze -- ``move_robot_to_position``: the one fully worked, robot-moving
     tool.
   * Silver -- ``get_robot_state``: read joints/TCP/mode/safety without moving.
+    ``move_robot_linear``: a TCP-space straight-line move (URScript ``movel``,
+    socket backend only -- the ROS2 backend needs IK, not yet implemented).
   * Gold -- ``move_through_waypoints``: a blended multi-point trajectory, with
     a state trace of how the move unfolded.
   * Diamond -- ``move_robot_to_position_safe``: workspace/speed/forward-
@@ -61,6 +63,11 @@ else:
 # Conservative joint-move defaults (rad/s, rad/s^2).
 DEFAULT_SPEED = 1.0
 DEFAULT_ACCEL = 1.4
+
+# TCP-space (movel) defaults -- different units than the joint-move ones
+# above (m/s, m/s^2), UR's own typical movel defaults.
+DEFAULT_LINEAR_SPEED = 0.25
+DEFAULT_LINEAR_ACCEL = 1.2
 
 # Home pose as degrees, for readable tool output and defaults.
 HOME_DEG = [round(math.degrees(a)) for a in HOME_Q_RAD]
@@ -165,6 +172,60 @@ def get_robot_state() -> dict:
         "tcp_pose": [round(v, 4) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
         "safety_status": state.safety_status,
+    }
+
+
+# =========================================================================== #
+# SILVER  --  a TCP-space linear move, so an agent can move in a straight
+# line (e.g. an approach/retreat) instead of the curved path a joint move
+# takes.
+# =========================================================================== #
+@mcp.tool
+def move_robot_linear(
+    tcp_pose: list[float],
+    speed: float = DEFAULT_LINEAR_SPEED,
+    acceleration: float = DEFAULT_LINEAR_ACCEL,
+) -> dict:
+    """Move the TCP in a straight line to an absolute pose and report the result.
+
+    Unlike move_robot_to_position (a joint-space move, curved TCP path), this
+    interpolates the TCP itself in a straight line -- use it when the path
+    matters (e.g. approaching a part without swinging sideways into it).
+
+    Args:
+        tcp_pose: Six numbers ``[x, y, z, rx, ry, rz]`` -- position in metres,
+            orientation as a UR-style rotation vector in radians (axis *
+            angle), base frame. Read the current pose from
+            get_robot_state()'s ``tcp_pose`` to build a target relative to it.
+        speed: TCP speed (m/s).
+        acceleration: TCP acceleration (m/s^2).
+
+    Returns:
+        A dict with the target pose that was commanded and the resulting
+        state: ``joints_deg``, ``tcp_pose``, ``robot_mode``.
+
+    Raises:
+        ValueError: ``tcp_pose`` isn't exactly 6 numbers.
+        RuntimeError: The robot is not powered on.
+        NotImplementedError: UR_BACKEND=ros2 -- this backend needs inverse
+            kinematics for a Cartesian move, not yet implemented; use
+            UR_BACKEND=socket for this tool.
+    """
+    # 1. Validate inputs.
+    if len(tcp_pose) != 6:
+        raise ValueError(f"Expected 6 values [x, y, z, rx, ry, rz], got {len(tcp_pose)}.")
+
+    # 2-3. No unit conversion or joint-limit check for a Cartesian target --
+    # the controller (movel) rejects an unreachable pose itself.
+    # 4. Execute (blocks until reached), then report the new state.
+    state = robot.move_linear(list(tcp_pose), speed, acceleration)
+    return {
+        "status": "reached",
+        "target_tcp_pose": [round(v, 4) for v in tcp_pose],
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
     }
 
 

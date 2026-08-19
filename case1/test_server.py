@@ -29,7 +29,7 @@ async def main() -> None:
         names = [t.name for t in await client.list_tools()]
         assert set(names) == {
             "move_robot_to_position", "example",
-            "get_robot_state", "move_through_waypoints",
+            "get_robot_state", "move_robot_linear", "move_through_waypoints",
             "move_robot_to_position_safe", "set_gripper",
         }, names
         print("tools:", names)
@@ -64,6 +64,35 @@ async def main() -> None:
         assert state.data["robot_mode"] == 7, state.data
         assert "safety_status" in state.data and "joint_speeds_deg_s" in state.data
         print("get_robot_state:", state.data["joints_deg"])
+
+        # Silver: TCP-space linear move -- lift 5cm in z, then come straight
+        # back, so the path is a straight line, not a curve. Not from home:
+        # HOME_DEG sits at a wrist singularity (wrist2 = 0deg, wrist1/wrist3
+        # axes align) where even a small movel spikes joint speed and trips
+        # a protective stop on the real controller -- reproduced while
+        # building this tool, along with a second singularity (shoulder)
+        # nearby at [20, -90, 30, -90, 60, 0] that looked safe (wrist2 =
+        # 60deg) but wasn't. This pose was verified clean over repeated
+        # movel calls (round trip, 3x) before being used here.
+        pre_linear = await client.call_tool(
+            "move_robot_to_position", {"joint_angles_deg": [30, -100, 40, -80, 70, 10]})
+        base_tcp = pre_linear.data["tcp_pose"]
+        lifted_tcp = [base_tcp[0], base_tcp[1], base_tcp[2] + 0.05, *base_tcp[3:]]
+        lin_up = await client.call_tool("move_robot_linear", {"tcp_pose": lifted_tcp})
+        assert lin_up.data["status"] == "reached"
+        print("move_robot_linear (up):", lin_up.data["tcp_pose"])
+
+        lin_down = await client.call_tool("move_robot_linear", {"tcp_pose": base_tcp})
+        assert lin_down.data["status"] == "reached"
+        print("move_robot_linear (down):", lin_down.data["tcp_pose"])
+
+        # Validation: the wrong number of pose values must be rejected.
+        try:
+            await client.call_tool("move_robot_linear", {"tcp_pose": [0, 0, 0]})
+        except Exception as exc:
+            print("bad linear pose rejected:", str(exc).splitlines()[-1].strip())
+        else:
+            raise AssertionError("bad linear pose was accepted")
 
         # Gold: blended multi-waypoint move, with a trace of how it went.
         path = await client.call_tool("move_through_waypoints", {
