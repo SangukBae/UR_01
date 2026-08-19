@@ -45,6 +45,7 @@ from server import mcp, robot  # noqa: E402
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.cerebras.ai/v1")
 MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")
 API_KEY_ENV = "CEREBRAS_API_KEY" if "cerebras" in BASE_URL else "LLM_API_KEY"
+MAX_TOOL_ROUNDS = 8
 
 SYSTEM_PROMPT = (
     "You control a UR10 robot arm through the tools available to you. "
@@ -128,8 +129,12 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
             messages.append({"role": "user", "content": user_text})
 
             # Tool-call loop: keep feeding results back until the model
-            # replies with plain text instead of another tool call.
-            while True:
+            # replies with plain text instead of another tool call. Capped --
+            # reproduced live: asked for a specific tool by description
+            # rather than name, the model called a different tool 31 times
+            # in a row (same args each time) instead of ever stopping or
+            # switching, with no error to break the loop on its own.
+            for _ in range(MAX_TOOL_ROUNDS):
                 response = llm.chat.completions.create(
                     model=MODEL, messages=messages, tools=tools,
                 )
@@ -152,6 +157,9 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
                     messages.append({
                         "role": "tool", "tool_call_id": call.id, "content": content,
                     })
+            else:
+                print(f"Robot: (stopped after {MAX_TOOL_ROUNDS} tool-call rounds "
+                      "without a final answer -- it may be stuck; try rephrasing)")
 
 
 def _text_input() -> str | None:
