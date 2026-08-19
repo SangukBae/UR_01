@@ -82,6 +82,21 @@ async def main(get_input: Callable[[], str | None], hint: str) -> None:
             f"Set {API_KEY_ENV} first (export {API_KEY_ENV}=...). "
             "Never hardcode an API key in this file -- see README.md."
         )
+    if not api_key.isascii():
+        # Copying a key out of a chat app is a common way to pick up an
+        # invisible character (smart quote, zero-width space) alongside it --
+        # reproduced live: pasted this way, the key made it into the
+        # Authorization header, and httpx2 (openai's HTTP client dep here)
+        # failed trying to ascii-encode it, 8 stack frames deep with no hint
+        # it was the key. Catch it here instead, pointing at the exact
+        # character so it's obvious what to fix.
+        bad = next((i, c) for i, c in enumerate(api_key) if not c.isascii())
+        raise SystemExit(
+            f"{API_KEY_ENV} has a non-ASCII character at position {bad[0]} "
+            f"({bad[1]!r}) -- probably picked up copying the key from a chat "
+            "app. Re-copy it from a plain-text source (or retype it) and "
+            "export it again."
+        )
     # Accept-Encoding: identity works around a brotli-decoder bug in this
     # sandbox's httpx2 (openai's HTTP client dep) -- decoder.decode() gets
     # called with an output_buffer_limit kwarg the installed `brotli`
