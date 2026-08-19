@@ -14,7 +14,8 @@ Control mode is not one, despite what this file used to say.
   through this driver instead of talking to the controller over raw sockets
   (`UR_BACKEND=ros2` in Case 1's server; see its README for the full picture).
   Same `RobotState` shape and method names as `case1/ur_client.py`, so every
-  tool works unchanged either way.
+  tool works unchanged either way -- except `move_robot_linear`, which this
+  backend raises `NotImplementedError` for (needs IK, not built yet).
 
 ## RMW note (sandboxed / restricted-network environments)
 

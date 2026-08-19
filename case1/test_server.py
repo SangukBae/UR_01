@@ -1,6 +1,6 @@
 """Smoke test for the Case 1 MCP server, run in-process (no subprocess, no LLM).
 
-Calls both tools through a FastMCP client against the live robot, so it checks
+Calls every tool through a FastMCP client against the live robot, so it checks
 the tool logic, input validation, and real motion in one go.
 
     python test_server.py

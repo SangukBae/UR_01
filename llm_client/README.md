@@ -26,7 +26,7 @@ python3 chat.py
 
 ```
 Connected: 7 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
-Type a message (e.g. 'move the robot home'), Ctrl-C to quit.
+Type a message (e.g. 'move the robot home'). Ctrl-C to quit.
 
 You: move the robot home
   -> move_robot_to_position({})
@@ -47,6 +47,8 @@ heard (STT can mishear), sends it same as typed input:
 
 ```
 Connected: 7 tools from ur-tools, model gpt-oss-120b @ https://api.cerebras.ai/v1
+Speaking mode -- each turn, just start talking. Ctrl-C to quit.
+
 🎤 Listening -- speak your command...
 You (heard): move the robot home
   -> move_robot_to_position({})
