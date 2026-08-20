@@ -1,69 +1,41 @@
-"""Live webcam demo: opens a camera, runs HumanHandTracker on every frame,
-draws skeleton/palm-center/orientation overlay, shows it in a window.
+"""Same as live_demo.py, but the object-detection overlay uses RT-DETR
+(a transformer-based detector, ultralytics.RTDETR) instead of ../yolo/'s
+YOLO26 model. See live_demo.py's own docstring for the full option list --
+only the detection backend differs, everything else (camera handling,
+--realsense distance, --ros2 topics, HumanHandTracker) is identical.
 
-    python3 live_demo.py              # camera index 0
-    python3 live_demo.py 1            # camera index 1
-    python3 live_demo.py --realsense  # use an attached Intel RealSense
-                                       # (D435 etc.) via pyrealsense2 instead
-                                       # of a plain UVC index -- needed
-                                       # because a RealSense exposes several
-                                       # /dev/video* nodes (depth, IR x2,
-                                       # color) and a bare index guess is
-                                       # unreliable; `pip install
-                                       # pyrealsense2` in this venv first
-    python3 live_demo.py --ros2       # also publish /vision/hands,
-                                       # /vision/humans_markers, /vision/humans_json
-                                       # (+ /vision/objects_json if --yolo is
-                                       # also given)
-                                       # (source /opt/ros/humble/setup.bash +
-                                       # RMW_IMPLEMENTATION first, same as
-                                       # ros2_vision_bridge/README.md)
-    python3 live_demo.py --yolo       # also detect objects with ../yolo/'s
-                                       # YOLO26 model (needs `pip install
-                                       # ultralytics` in this venv). Runs on
-                                       # CPU by default; set YOLO_DEVICE=0 to
-                                       # use a CUDA GPU if this machine has
-                                       # one, and YOLO_MODEL=yolo26s.pt (or
-                                       # 26m/26l/26x) to use a larger, more
-                                       # accurate model than the default
-                                       # nano -- auto-downloads to ../yolo/
-                                       # if not already present there
+    python3 live_demo_rtdetr.py              # camera index 0
+    python3 live_demo_rtdetr.py --detect      # also run RT-DETR object
+                                               # detection (needs `pip
+                                               # install ultralytics` in
+                                               # this venv, same package
+                                               # YOLO26 uses)
+    python3 live_demo_rtdetr.py --realsense --detect --ros2
 
-With --realsense, every hand and (if --yolo) object also gets a real
-`distance_m` (meters, from the RealSense depth sensor, aligned to the
-color frame -- see realsense_camera.py's RealSenseCapture.get_distance)
-printed to the console and drawn on the video. None if depth data wasn't
-available at that pixel (out of the sensor's range, a reflective/dark
-surface, etc.) -- not shown on plain-webcam runs, which have no depth.
+RTDETR_DEVICE (default "cpu") and RTDETR_MODEL (default "rtdetr-x.pt")
+env vars mirror live_demo.py's YOLO_DEVICE/YOLO_MODEL -- set
+RTDETR_DEVICE=0 to run on a CUDA GPU. The weights auto-download to
+../yolo/ (same directory YOLO26's weights live in) if not already there.
+rtdetr-l.pt is the only smaller variant Ultralytics ships for this
+architecture (no n/s/m sizes like YOLO26 has) -- x is what's benchmarked
+in this repo's notes.
 
-Press 'q' in the window to quit.
-
---ros2 builds and publishes the same topics as
-ros2_vision_bridge/vision_bridge_node.py (+ /vision/objects_json, same as
-realsense_vision_node.py, when --yolo is also given), but in-process from
-this script's own camera read/detect loop instead of polling
-vision_human_track's REST API or owning the camera in a separate node --
-so this one script alone can show the GUI window AND publish every topic
-realsense_vision_node.py does. Don't run this alongside vision_bridge_node.py
-or realsense_vision_node.py at the same time -- they'd publish onto the
-same topic names, and two processes can't share one camera device anyway.
+Reuses ../yolo/smoke_test.py's serialize_detections/plot_instance_names
+(same as live_demo.py does) rather than duplicating them -- both just
+operate on an ultralytics Results object's .boxes, which RTDETR produces
+in the same shape YOLO does, so no changes needed there.
 
 With --realsense --ros2 together, also publishes TF (via /tf): the fixed
 flange -> camera_optical_frame mount (StaticTransformBroadcaster, same
 CAMERA_R/CAMERA_T as ros2_vision_bridge/camera_tf_publisher.py -- imported
-from there, not duplicated) published once at startup, plus (with --yolo
+from there, not duplicated) published once at startup, plus (with --detect
 too) a dynamic camera_optical_frame -> object_<instance_name> TF per
 detected object every frame (real 3D point from RealSenseCapture.deproject,
 same as realsense_vision_node.py's _publish_object_tfs -- shared via
-vision_bridge_node.build_object_tfs, not duplicated). So this one script
-alone can also close the flange -> object TF chain that camera_tf_publisher.py
-+ realsense_vision_node.py would otherwise need two separate processes for.
+vision_bridge_node.build_object_tfs, not duplicated). Same feature as
+live_demo.py's --ros2 mode, just with RT-DETR standing in for YOLO26.
 
---yolo runs ../yolo/'s object-detection model (a teammate's module, not
-part of this user's human/hand assignment) on every frame alongside
-PoseLandmarker/HandLandmarker, drawing both overlays on the same window and
-printing both to the console. Two CPU models per frame is heavier than
-either alone -- expect a real FPS drop versus running just one.
+Press 'q' in the window to quit.
 """
 import argparse
 import json
@@ -84,11 +56,11 @@ from test_real_image import draw_result  # noqa: E402
 POINTS_TO_PRINT = [0, 1, 4, 5, 8, 17, 20]
 
 
-def draw_distances(image, result, yolo_detections, width, height):
-    """Separate overlay pass, after draw_result()/yolo_plot() have already
+def draw_distances(image, result, detections, width, height):
+    """Separate overlay pass, after draw_result()/det_plot() have already
     drawn the skeleton/box overlays -- keeps this module's own distance
-    text independent of test_real_image.py's draw_result and the
-    teammate's yolo_plot, rather than reaching into either."""
+    text independent of test_real_image.py's draw_result and RT-DETR's
+    plot function, rather than reaching into either."""
     all_hands = list(result["unassigned_hands"])
     for human in result["humans"]:
         all_hands.extend(human["hands"])
@@ -100,8 +72,8 @@ def draw_distances(image, result, yolo_detections, width, height):
         cv2.putText(image, f"{distance:.2f}m", (x + 8, y - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-    if yolo_detections:
-        for det in yolo_detections:
+    if detections:
+        for det in detections:
             distance = det.get("distance_m")
             if distance is None:
                 continue
@@ -124,7 +96,7 @@ def _print_hand(hand, prefix="    "):
               f"x={lm['x']:.3f} y={lm['y']:.3f} z={lm['z']:.3f}")
 
 
-def print_coords(result, yolo_detections=None):
+def print_coords(result, detections=None):
     if not result["humans"] and not result["unassigned_hands"]:
         print("  (no people/hands detected)")
     for human in result["humans"]:
@@ -135,10 +107,10 @@ def print_coords(result, yolo_detections=None):
         print("  unassigned")
         _print_hand(hand, prefix="    ")
 
-    if yolo_detections is not None:
-        if not yolo_detections:
+    if detections is not None:
+        if not detections:
             print("  (no objects detected)")
-        for det in yolo_detections:
+        for det in detections:
             distance = det.get("distance_m")
             distance_str = f"{distance:.2f}m" if distance is not None else "n/a"
             print(f"  object {det['instance_name']} "
@@ -160,30 +132,31 @@ def main():
              "/vision/humans_json (same topics as ros2_vision_bridge)",
     )
     parser.add_argument(
-        "--yolo", action="store_true",
-        help="also detect objects with ../yolo/'s YOLO26 model",
+        "--detect", action="store_true",
+        help="also detect objects with RT-DETR (ultralytics.RTDETR, "
+             "rtdetr-x.pt by default)",
     )
     args = parser.parse_args()
     camera_index = args.camera_index
 
-    yolo_model = None
-    yolo_serialize = None
-    yolo_plot = None
-    yolo_device = "cpu"
-    if args.yolo:
+    det_model = None
+    det_serialize = None
+    det_plot = None
+    det_device = "cpu"
+    if args.detect:
         import os
 
         yolo_dir = Path(__file__).resolve().parent.parent / "yolo"
         sys.path.insert(0, str(yolo_dir))
         from smoke_test import plot_instance_names, serialize_detections  # noqa: E402
-        from ultralytics import YOLO  # noqa: E402
+        from ultralytics import RTDETR  # noqa: E402
 
-        yolo_serialize = serialize_detections
-        yolo_plot = plot_instance_names
-        yolo_device = os.environ.get("YOLO_DEVICE", "cpu")
-        yolo_model_name = os.environ.get("YOLO_MODEL", "yolo26n.pt")
-        print(f"Loading YOLO model {yolo_model_name} ({yolo_device})...")
-        yolo_model = YOLO(str(yolo_dir / yolo_model_name))
+        det_serialize = serialize_detections
+        det_plot = plot_instance_names
+        det_device = os.environ.get("RTDETR_DEVICE", "cpu")
+        det_model_name = os.environ.get("RTDETR_MODEL", "rtdetr-x.pt")
+        print(f"Loading RT-DETR model {det_model_name} ({det_device})...")
+        det_model = RTDETR(str(yolo_dir / det_model_name))
 
     ros_node = None
     ros_pubs = None
@@ -206,14 +179,14 @@ def main():
         )
 
         rclpy.init()
-        ros_node = rclpy.create_node("live_demo_vision_publisher")
+        ros_node = rclpy.create_node("live_demo_rtdetr_vision_publisher")
         ros_pubs = {
             "hands": ros_node.create_publisher(PoseArray, "/vision/hands", 10),
             "markers": ros_node.create_publisher(MarkerArray, "/vision/humans_markers", 10),
             "json": ros_node.create_publisher(String, "/vision/humans_json", 10),
         }
         topics = "/vision/hands, /vision/humans_markers, /vision/humans_json"
-        if args.yolo:
+        if args.detect:
             ros_pubs["objects"] = ros_node.create_publisher(String, "/vision/objects_json", 10)
             topics += ", /vision/objects_json"
         print(f"ROS2 publishing enabled: {topics}")
@@ -245,7 +218,7 @@ def main():
             static_tf_broadcaster.sendTransform(static_tf)
             print(f"Published static TF 'flange' -> {camera_frame_id!r}")
 
-            if args.yolo:
+            if args.detect:
                 ros_tf_broadcaster = TransformBroadcaster(ros_node)
 
     if args.realsense:
@@ -296,7 +269,7 @@ def main():
     tracker = HumanHandTracker()
     print("Ready. Press 'q' in the video window to quit.")
 
-    cv2.namedWindow("UR_01 human+hand tracking", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("UR_01 human+hand tracking (RT-DETR)", cv2.WINDOW_NORMAL)
 
     frame_count = 0
     fps_t0 = time.time()
@@ -313,47 +286,47 @@ def main():
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = tracker.detect(mp_image)
 
-            yolo_detections = None
-            if yolo_model is not None:
-                yolo_result = yolo_model.predict(
-                    source=bgr, conf=0.25, device=yolo_device, verbose=False
+            detections = None
+            if det_model is not None:
+                det_result = det_model.predict(
+                    source=bgr, conf=0.25, device=det_device, verbose=False
                 )[0]
-                yolo_detections = yolo_serialize(yolo_result)
+                detections = det_serialize(det_result)
 
             if args.realsense:
-                add_distances(result, yolo_detections, cap, width, height)
+                add_distances(result, detections, cap, width, height)
 
             if ros_node is not None:
                 stamp = ros_node.get_clock().now().to_msg()
                 ros_pubs["hands"].publish(build_hands_msg(result, stamp, camera_frame_id))
                 ros_pubs["markers"].publish(build_markers_msg(result, stamp, camera_frame_id))
                 ros_pubs["json"].publish(String(data=json.dumps(result)))
-                if "objects" in ros_pubs and yolo_detections is not None:
+                if "objects" in ros_pubs and detections is not None:
                     ros_pubs["objects"].publish(String(data=json.dumps({
-                        "objects": yolo_detections, "frame_width": width, "frame_height": height,
+                        "objects": detections, "frame_width": width, "frame_height": height,
                     })))
                     if ros_tf_broadcaster is not None:
-                        transforms = build_object_tfs(yolo_detections, cap, camera_frame_id, stamp)
+                        transforms = build_object_tfs(detections, cap, camera_frame_id, stamp)
                         if transforms:
                             ros_tf_broadcaster.sendTransform(transforms)
                 rclpy.spin_once(ros_node, timeout_sec=0)
 
             annotated = draw_result(bgr, result)
-            if yolo_detections is not None:
-                annotated = yolo_plot(yolo_result, yolo_detections, image=annotated)
+            if detections is not None:
+                annotated = det_plot(det_result, detections, image=annotated)
             if args.realsense:
-                annotated = draw_distances(annotated, result, yolo_detections, width, height)
+                annotated = draw_distances(annotated, result, detections, width, height)
 
             frame_count += 1
             elapsed = time.time() - fps_t0
             if elapsed >= 1.0:
                 fps = frame_count / elapsed
-                cv2.setWindowTitle("UR_01 human+hand tracking", f"live ({fps:.1f} fps)")
+                cv2.setWindowTitle("UR_01 human+hand tracking (RT-DETR)", f"live ({fps:.1f} fps)")
                 frame_count = 0
                 fps_t0 = time.time()
-                print_coords(result, yolo_detections)
+                print_coords(result, detections)
 
-            cv2.imshow("UR_01 human+hand tracking", annotated)
+            cv2.imshow("UR_01 human+hand tracking (RT-DETR)", annotated)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:

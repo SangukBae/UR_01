@@ -48,3 +48,90 @@ def quat_rotate_z_axis(q: tuple[float, float, float, float]) -> tuple[float, flo
         2 * (y * z - w * x),
         1 - 2 * (x * x + y * y),
     )
+
+
+def quat_rotate_vector(
+    q: tuple[float, float, float, float], v: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """Apply quaternion q=(x,y,z,w) to an arbitrary vector v -- general
+    version of quat_rotate_z_axis, used to round-trip-test
+    matrix_to_quaternion against arbitrary rotation matrices."""
+    qx, qy, qz, qw = q
+    vx, vy, vz = v
+    uvx, uvy, uvz = qy * vz - qz * vy, qz * vx - qx * vz, qx * vy - qy * vx
+    uuvx = qy * uvz - qz * uvy
+    uuvy = qz * uvx - qx * uvz
+    uuvz = qx * uvy - qy * uvx
+    return (
+        vx + 2 * (qw * uvx + uuvx),
+        vy + 2 * (qw * uvy + uuvy),
+        vz + 2 * (qw * uvz + uuvz),
+    )
+
+
+def matrix_to_quaternion(
+    R: list[list[float]], tol: float = 1e-4
+) -> tuple[float, float, float, float]:
+    """(x, y, z, w) quaternion for a proper 3x3 rotation matrix ``R`` (a
+    list of 3 rows), for turning a fixed camera<->flange mounting
+    rotation into a TF.
+
+    Raises ValueError if ``R`` isn't -- within ``tol`` -- an orthogonal
+    matrix with det=+1. Quaternions can only represent SO(3) (proper
+    rotations); silently converting a reflection (det=-1, or any other
+    non-rotation from e.g. a transcription typo) would produce a
+    quaternion that does NOT actually reproduce R, which is worse than a
+    loud error for something feeding a robot-relative TF.
+    """
+    r = R
+    for i in range(3):
+        for j in range(3):
+            dot = sum(r[k][i] * r[k][j] for k in range(3))
+            expected = 1.0 if i == j else 0.0
+            if abs(dot - expected) > tol:
+                raise ValueError(
+                    f"matrix_to_quaternion: R is not orthogonal (columns {i} "
+                    f"and {j} of R^T R differ from identity by "
+                    f"{dot - expected:.4g}) -- check the matrix for a "
+                    "transcription error."
+                )
+    det = (
+        r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+        - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+        + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
+    )
+    if abs(det - 1.0) > tol:
+        raise ValueError(
+            f"matrix_to_quaternion: det(R) = {det:.4g}, not +1 -- R is a "
+            "reflection, not a proper rotation, so it has no quaternion "
+            "representation. This usually means one entry's sign was "
+            "mistyped -- check against the physical mount before using it."
+        )
+
+    trace = r[0][0] + r[1][1] + r[2][2]
+    if trace > 0:
+        s = math.sqrt(trace + 1.0) * 2  # s = 4*qw
+        qw = 0.25 * s
+        qx = (r[2][1] - r[1][2]) / s
+        qy = (r[0][2] - r[2][0]) / s
+        qz = (r[1][0] - r[0][1]) / s
+    elif r[0][0] > r[1][1] and r[0][0] > r[2][2]:
+        s = math.sqrt(1.0 + r[0][0] - r[1][1] - r[2][2]) * 2  # s = 4*qx
+        qw = (r[2][1] - r[1][2]) / s
+        qx = 0.25 * s
+        qy = (r[0][1] + r[1][0]) / s
+        qz = (r[0][2] + r[2][0]) / s
+    elif r[1][1] > r[2][2]:
+        s = math.sqrt(1.0 + r[1][1] - r[0][0] - r[2][2]) * 2  # s = 4*qy
+        qw = (r[0][2] - r[2][0]) / s
+        qx = (r[0][1] + r[1][0]) / s
+        qy = 0.25 * s
+        qz = (r[1][2] + r[2][1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2][2] - r[0][0] - r[1][1]) * 2  # s = 4*qz
+        qw = (r[1][0] - r[0][1]) / s
+        qx = (r[0][2] + r[2][0]) / s
+        qy = (r[1][2] + r[2][1]) / s
+        qz = 0.25 * s
+
+    return (qx, qy, qz, qw)

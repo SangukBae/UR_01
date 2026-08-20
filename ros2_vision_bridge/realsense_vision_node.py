@@ -44,6 +44,14 @@ works unchanged regardless of which bridge is running):
                            are in pixel xyxy at that resolution. Only
                            published when YOLO is enabled.
 
+Also publishes a TF (via /tf, tf2_ros.TransformBroadcaster) for every YOLO
+object with a valid depth reading: camera_frame_id -> object_<instance_name>
+(e.g. "object_cup1"), translation = the real 3D point deprojected from that
+object's bbox-center pixel + distance_m, rotation = identity (a 2D detector
+gives no orientation, so the object frame is just axis-aligned to the
+camera). Combine with camera_tf_publisher.py's flange -> camera_frame_id
+static TF to get any object's pose directly in the flange frame for free.
+
 Every hand (in /vision/humans_json) and object (in /vision/objects_json)
 also carries a `distance_m` field -- real depth in meters from the
 RealSense's depth sensor at that hand/object's pixel, aligned to the color
@@ -69,6 +77,7 @@ import rclpy
 from geometry_msgs.msg import PoseArray
 from rclpy.node import Node
 from std_msgs.msg import String
+from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import MarkerArray
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,9 +86,9 @@ sys.path.insert(0, str(_REPO_ROOT / "vision_human_track"))
 sys.path.insert(0, str(_REPO_ROOT / "vision_human_track" / "src"))
 
 from detector import HumanHandTracker  # noqa: E402
-from live_demo import add_distances  # noqa: E402
+from distance_utils import add_distances  # noqa: E402
 from realsense_camera import RealSenseCapture, list_realsense_devices  # noqa: E402
-from vision_bridge_node import build_hands_msg, build_markers_msg  # noqa: E402
+from vision_bridge_node import build_hands_msg, build_markers_msg, build_object_tfs  # noqa: E402
 
 
 class RealsenseVisionNode(Node):
@@ -87,7 +96,7 @@ class RealsenseVisionNode(Node):
         super().__init__("realsense_vision_bridge")
 
         self.declare_parameter("poll_rate_hz", 10.0)
-        self.declare_parameter("camera_frame_id", "camera_link")
+        self.declare_parameter("camera_frame_id", "camera_optical_frame")
         rate_hz = self.get_parameter("poll_rate_hz").value
         self._frame_id = self.get_parameter("camera_frame_id").value
 
@@ -127,6 +136,7 @@ class RealsenseVisionNode(Node):
         self._objects_pub = None
         if self._yolo_model is not None:
             self._objects_pub = self.create_publisher(String, "/vision/objects_json", 10)
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self._frame_count = 0
         self._fps_t0 = time.time()
@@ -166,6 +176,7 @@ class RealsenseVisionNode(Node):
             self._objects_pub.publish(String(data=json.dumps({
                 "objects": detections, "frame_width": width, "frame_height": height,
             })))
+            self._publish_object_tfs(detections, stamp)
 
         self._frame_count += 1
         elapsed = time.time() - self._fps_t0
@@ -174,6 +185,13 @@ class RealsenseVisionNode(Node):
             self.get_logger().info(f"~{fps:.1f} fps")
             self._frame_count = 0
             self._fps_t0 = time.time()
+
+    def _publish_object_tfs(self, detections, stamp):
+        """One TF per detected object with a valid depth reading, parented
+        to this node's camera frame -- see the module docstring."""
+        transforms = build_object_tfs(detections, self._cap, self._frame_id, stamp)
+        if transforms:
+            self._tf_broadcaster.sendTransform(transforms)
 
     def destroy_node(self):
         self._cap.release()

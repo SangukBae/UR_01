@@ -33,6 +33,18 @@ Topics published:
                          21-point landmarks, unassigned_hands -- for any
                          consumer that wants more than the two topics above
                          give without a custom .msg package.
+  /vision/objects_json   std_msgs/String
+                         only published when the polled response carries an
+                         `objects` field (i.e. the service was started with
+                         YOLO_ENABLED=true) -- same shape
+                         realsense_vision_node.py publishes:
+                         {"objects": [...], "frame_width": W,
+                         "frame_height": H}. No TF here, unlike
+                         realsense_vision_node.py's per-object TF -- this
+                         node never owns the camera, so it has no
+                         intrinsics/deproject() to turn a pixel + depth
+                         into a 3D point; use realsense_vision_node.py
+                         directly instead if you need that.
 
 Coordinate frame: everything above is in the vision service's own output
 frame (camera-relative, normalized [0,1] image x/y, MediaPipe's relative
@@ -40,12 +52,13 @@ z) -- NOT the robot/world frame. Per the team's first architecture
 meeting, transforming that into robot coordinates is a separate ROS-side
 job, deliberately not done in this node.
 """
+import json
 import sys
 import time
 from pathlib import Path
 
 import rclpy
-from geometry_msgs.msg import Point, Pose, PoseArray
+from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped
 from rclpy.node import Node
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
@@ -118,6 +131,36 @@ def build_markers_msg(data: dict, stamp, frame_id: str) -> MarkerArray:
     return markers
 
 
+def build_object_tfs(detections: list[dict], cap, frame_id: str, stamp) -> list[TransformStamped]:
+    """One TransformStamped per detected object with a valid depth
+    reading (parented to `frame_id`, expected to be the camera's own
+    optical frame -- see camera_tf_publisher.py). Shared by
+    realsense_vision_node.py and live_demo.py's --ros2 mode.
+
+    ``cap`` must have RealSenseCapture's `deproject(x, y, depth_m)` (a
+    plain cv2.VideoCapture has no depth, so this is only called when
+    `--realsense` is on); ``detections`` are YOLO dicts with `xyxy`,
+    `instance_name`, and (from add_distances) `distance_m`.
+    """
+    transforms = []
+    for det in detections:
+        distance = det.get("distance_m")
+        if distance is None:
+            continue
+        x1, y1, x2, y2 = det["xyxy"]
+        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+        point = cap.deproject(cx, cy, distance)
+
+        tf = TransformStamped()
+        tf.header.stamp = stamp
+        tf.header.frame_id = frame_id
+        tf.child_frame_id = f"object_{det['instance_name']}"
+        tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z = point
+        tf.transform.rotation.w = 1.0  # no orientation from a 2D detector -- axis-aligned to the camera
+        transforms.append(tf)
+    return transforms
+
+
 class VisionBridgeNode(Node):
     def __init__(self):
         import requests  # only this class polls the REST API; keeps the
@@ -137,6 +180,10 @@ class VisionBridgeNode(Node):
         self._hands_pub = self.create_publisher(PoseArray, "/vision/hands", 10)
         self._markers_pub = self.create_publisher(MarkerArray, "/vision/humans_markers", 10)
         self._json_pub = self.create_publisher(String, "/vision/humans_json", 10)
+        # Only actually publishes if a poll response ever contains an
+        # "objects" field (YOLO_ENABLED=true on the service side) -- see
+        # this module's docstring.
+        self._objects_pub = self.create_publisher(String, "/vision/objects_json", 10)
 
         self._session = requests.Session()
         self._warned_unreachable = False
@@ -168,6 +215,12 @@ class VisionBridgeNode(Node):
         self._json_pub.publish(String(data=resp.text))
         self._publish_hands(data, stamp)
         self._publish_markers(data, stamp)
+        if "objects" in data:
+            self._objects_pub.publish(String(data=json.dumps({
+                "objects": data["objects"],
+                "frame_width": data.get("frame_width"),
+                "frame_height": data.get("frame_height"),
+            })))
 
     def _publish_hands(self, data: dict, stamp) -> None:
         self._hands_pub.publish(build_hands_msg(data, stamp, self._frame_id))

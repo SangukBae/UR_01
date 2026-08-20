@@ -63,6 +63,15 @@ Tools, by tier:
     robot calibration exists in this repo, so this only turns the base
     joint toward a hand's left/right position in frame -- a demo of the
     reactive loop, not real 3D tracking.
+  * ``move_robot_to_object`` -- unlike ``track``, uses a real 3D position
+    via TF (``vision_tf.py``: base_link -> ... -> flange ->
+    camera_optical_frame -> object_<name>, composed by tf2 -- see
+    ``ros2_vision_bridge/camera_tf_publisher.py`` and
+    ``realsense_vision_node.py``/``live_demo*.py --ros2``). Moves the TCP
+    in a straight line toward the named object, stopping short by
+    ``approach_offset_m``. Approach only -- no grasp, no gripper-aiming
+    orientation. The camera<->flange calibration it depends on is not yet
+    empirically confirmed; see that tool's own docstring.
 
 Return JSON-serializable dicts with explicit units in the key names.
 """
@@ -1170,14 +1179,19 @@ def get_environment() -> dict:
     Non-destructive check before acting -- e.g. confirm a person is
     actually visible before doing something that assumes they are.
 
-    Note: only reports people/hands (this repo's Vision Stack scope).
-    Object detection (apple/cup/etc.) is a separate, not-yet-integrated
-    service -- see ../vision_human_track/README.md.
+    Note: ``objects`` (apple/cup/etc., a teammate's YOLO model) is only
+    present if the vision service was started with YOLO_ENABLED=true --
+    see ../vision_human_track/README.md's "Modular deployment". Omitted
+    entirely otherwise, not an empty list, so a caller can tell "object
+    detection isn't running" apart from "nothing detected."
 
     Returns:
         A dict with ``humans``: a list of ``{id, num_hands, hands: [{
         handedness, palm_center, normal}]}`` -- position/orientation only,
-        not the full per-joint skeleton (see get_vision for that).
+        not the full per-joint skeleton (see get_vision for that) --
+        and, when available, ``objects``: a list of ``{class_name,
+        instance_name, confidence, xyxy}`` (pixel coordinates, see
+        ../vision_human_track/README.md's "Output coordinates in detail").
 
     Raises:
         RuntimeError: The vision service isn't reachable.
@@ -1194,7 +1208,14 @@ def get_environment() -> dict:
                 for hand in h["hands"]
             ],
         })
-    return {"humans": humans}
+    result = {"humans": humans}
+    if "objects" in data:
+        result["objects"] = [
+            {"class_name": o["class_name"], "instance_name": o["instance_name"],
+             "confidence": o["confidence"], "xyxy": o["xyxy"]}
+            for o in data["objects"]
+        ]
+    return result
 
 
 @mcp.tool
@@ -1293,6 +1314,121 @@ def track(duration_s: float = 10.0, poll_hz: float = 2.0) -> dict:
         "updates": updates,
         "joints_deg": {n: round(math.degrees(q), 1)
                        for n, q in zip(JOINT_NAMES, final_state.q_rad)},
+    }
+
+
+# =========================================================================== #
+# OBJECT APPROACH  --  unlike track (above), this uses a real 3D position,
+# not just a hand's left/right position in frame. Only possible now because
+# camera_tf_publisher.py + realsense_vision_node.py/live_demo*.py --ros2
+# publish a full base_link -> ... -> flange -> camera_optical_frame ->
+# object_<name> TF chain (vision_tf.py) -- tf2 composes it, no manual
+# forward-kinematics math needed here. Still approach-only (stops short by
+# approach_offset_m), not a full grasp -- no gripper close, no orientation
+# aiming at the object (keeps the current TCP orientation).
+# =========================================================================== #
+_vision_tf = None
+_vision_tf_lock = threading.Lock()
+
+
+def _get_vision_tf():
+    global _vision_tf
+    with _vision_tf_lock:
+        if _vision_tf is None:
+            from vision_tf import VisionTF
+
+            vtf = VisionTF()
+            vtf.connect()
+            _vision_tf = vtf
+    return _vision_tf
+
+
+@mcp.tool
+def move_robot_to_object(
+    object_name: str,
+    approach_offset_m: float = 0.15,
+    speed: float = DEFAULT_LINEAR_SPEED,
+    acceleration: float = DEFAULT_LINEAR_ACCEL,
+) -> dict:
+    """Move the TCP in a straight line toward a camera-detected object,
+    stopping short of it by approach_offset_m -- e.g. "pick up the apple"
+    should call this with object_name="apple" before any grasp logic.
+
+    Looks up the object's real 3D position via TF (base_link -> ... ->
+    flange -> camera_optical_frame -> object_<name>, see vision_tf.py),
+    then moves the TCP in a straight line (like move_robot_linear) to a
+    point short of it by approach_offset_m, along the line from the
+    robot's current TCP position to the object -- so the tool stops
+    before contact instead of driving into the object. Keeps the current
+    TCP orientation; does not aim the gripper at the object or close it.
+
+    CAUTION: the flange<->camera mounting calibration this depends on
+    (CAMERA_R in ../ros2_vision_bridge/camera_tf_publisher.py) is not yet
+    empirically confirmed against a real depth reading -- the computed
+    position could be wrong (wrong side, wrong distance). Verify in the
+    simulator first, and see that module's comments before trusting this
+    against a real robot.
+
+    Args:
+        object_name: Object class name as the detector reports it, e.g.
+            "apple" (matches object_apple1, object_apple2, ... -- see
+            ../yolo/smoke_test.py's serialize_detections). If multiple
+            instances are detected, the closest one to the robot's base
+            is used.
+        approach_offset_m: How far short of the object's position to
+            stop, in metres, measured back along the line from the
+            robot's current TCP position to the object. Must be >= 0.
+        speed: TCP speed (m/s).
+        acceleration: TCP acceleration (m/s^2).
+
+    Returns:
+        A dict with the object frame matched (``object_frame``), its
+        position in the base frame (``object_position_m``), the target
+        pose actually commanded (``target_tcp_pose``), and the resulting
+        state (``joints_deg``, ``tcp_pose``, ``robot_mode``).
+
+    Raises:
+        ValueError: approach_offset_m is negative.
+        RuntimeError: the object isn't currently visible in the TF tree
+            (see vision_tf.py's find_object for the exact checklist), or
+            the robot isn't powered on.
+        NotImplementedError: UR_BACKEND=ros2 -- move_linear needs IK, not
+            yet implemented there; use UR_BACKEND=socket.
+    """
+    # 1. Validate inputs.
+    if approach_offset_m < 0:
+        raise ValueError(f"approach_offset_m must be >= 0, got {approach_offset_m}.")
+
+    # 2. Look up the object's real position (base frame) via TF.
+    found = _get_vision_tf().find_object(object_name)
+    ox, oy, oz = found["position_m"]
+
+    # 3. Compute a target short of the object, along the line from the
+    # current TCP position to it -- stop before contact, not on it.
+    current = robot.get_state()
+    cx, cy, cz = current.tcp_pose[:3]
+    dx, dy, dz = ox - cx, oy - cy, oz - cz
+    distance = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if distance < 1e-6:
+        raise RuntimeError(
+            "The object's position is (numerically) the same as the "
+            "current TCP position -- nothing to approach."
+        )
+    ux, uy, uz = dx / distance, dy / distance, dz / distance
+    stop_at = max(distance - approach_offset_m, 0.0)
+    target_xyz = [cx + ux * stop_at, cy + uy * stop_at, cz + uz * stop_at]
+    target_pose = target_xyz + list(current.tcp_pose[3:])  # keep current orientation
+
+    # 4. Execute (blocks until reached), then report the new state.
+    state = robot.move_linear(target_pose, speed, acceleration)
+    return {
+        "object_frame": found["frame_id"],
+        "object_position_m": found["position_m"],
+        "target_tcp_pose": [round(v, 4) for v in target_pose],
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
     }
 
 

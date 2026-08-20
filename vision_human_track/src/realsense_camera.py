@@ -93,6 +93,22 @@ class RealSenseCapture:
         samples.sort()
         return samples[len(samples) // 2]
 
+    def get_intrinsics(self):
+        """The color stream's pyrealsense2 intrinsics (depth is aligned to
+        color on every read(), so these apply to depth pixels too) --
+        needed to turn a color-frame pixel + depth into a real 3D point."""
+        return self._profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+
+    def deproject(self, x: int, y: int, depth_m: float) -> tuple[float, float, float]:
+        """3D point (X, Y, Z) in metres, in the color camera's optical
+        frame (X right, Y down, Z forward -- rs2's standard convention),
+        for a color-frame pixel at a known depth. Takes ``depth_m`` rather
+        than sampling it itself so callers that already called
+        get_distance(x, y) (e.g. to fill in a `distance_m` field) reuse
+        that same number instead of a second, possibly-different sample.
+        """
+        return tuple(rs.rs2_deproject_pixel_to_point(self.get_intrinsics(), [float(x), float(y)], depth_m))
+
     def release(self):
         if self._opened:
             self._pipeline.stop()
