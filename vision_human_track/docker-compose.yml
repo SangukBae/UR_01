@@ -20,19 +20,14 @@ services:
       # integrating against /detect/image only.
       CAMERA_BACKEND: "${CAMERA_BACKEND:-cv2}"
       YOLO_ENABLED: "${YOLO_ENABLED:-true}"
-      YOLO_DEVICE: "${YOLO_DEVICE:-0}"
+      # "cpu" by default so a plain `docker compose up` works on ANY
+      # machine, including a teammate's laptop with no GPU at all --
+      # see docker-compose.gpu.yml for the opt-in override that actually
+      # uses one. Don't set this to a GPU index here; nothing reserves a
+      # GPU in this base file (see below), so YOLO would just fail to
+      # find the device Ultralytics was told to use.
+      YOLO_DEVICE: "${YOLO_DEVICE:-cpu}"
       YOLO_MODEL: "${YOLO_MODEL:-yolo26n.pt}"
-    # GPU passthrough for YOLO (YOLO_DEVICE=0) -- needs nvidia-container-
-    # toolkit on the host (already present on this machine: `docker info`
-    # lists an `nvidia` runtime). Falls back cleanly to CPU if this block
-    # is removed and YOLO_DEVICE is set to "cpu" instead.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     # RealSense USB passthrough (CAMERA_BACKEND=realsense above). Uncomment
     # both lines below -- privileged is the simplest reliable way to get a
     # RealSense's USB bulk-transfer endpoints into a container (a plain

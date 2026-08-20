@@ -103,34 +103,53 @@ mix without touching code:
 |-------------------|-----------|-------------------------------------------------------------------|
 | `CAMERA_BACKEND`  | `cv2`      | `cv2` (any UVC webcam) or `realsense` (Intel RealSense, real depth) |
 | `YOLO_ENABLED`    | `true`     | fold in the teammate's YOLO26 object detection                    |
-| `YOLO_DEVICE`     | `0`        | GPU index for YOLO, or `cpu`                                      |
+| `YOLO_DEVICE`     | `cpu`      | `cpu` (works everywhere) or a GPU index (`0`) — see `docker-compose.gpu.yml` below, a plain `docker compose up` never reserves a GPU |
 | `YOLO_MODEL`      | `yolo26n.pt` | which YOLO26 size (`n/s/m/l/x`) — baked into the image at build time via the matching `--build-arg` |
 
+`docker-compose.gpu.yml` is a separate, opt-in override — **not** merged
+into the base file — because a `deploy.resources.reservations.devices`
+block with `driver: nvidia` makes `docker compose up` hard-fail outright
+on any machine without an nvidia GPU + `nvidia-container-toolkit` (this is
+Compose's actual behavior, confirmed, not a hypothetical). Most teammates'
+laptops don't have that, so the base file has to work without it — this is
+the actual answer to "how do I run this on someone else's computer":
+
 ```bash
-# Zero-hardware default: human/hand + object detection, cv2 camera backend,
-# GPU YOLO -- works out of the box for anyone without a RealSense attached.
+# Zero-hardware, zero-GPU default -- works on literally any machine with
+# Docker: human/hand + object detection, cv2 camera backend, CPU YOLO.
+# This is what a teammate with a plain laptop should run.
 docker compose up -d --build
+curl http://localhost:8000/health
+
+# This machine specifically (or any machine with an nvidia GPU +
+# nvidia-container-toolkit -- check with `nvidia-smi` and
+# `docker info | grep -i nvidia`): add the GPU override file and set
+# YOLO_DEVICE to a GPU index.
+YOLO_DEVICE=0 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 # The real deployment target -- RealSense mounted on the robot arm.
 # Uncomment `privileged`/`/dev/bus/usb` in docker-compose.yml first (see
 # the comments there for why -- a RealSense isn't a single /dev/video*
-# node, so a plain --device mapping doesn't work), then:
+# node, so a plain --device mapping doesn't work), then combine with
+# either command above depending on whether that machine also has a GPU:
 CAMERA_BACKEND=realsense docker compose up -d --build
-
-# CPU-only YOLO (no nvidia-container-toolkit on the host):
-YOLO_DEVICE=cpu docker compose up -d --build   # also remove the deploy.resources
-                                                 # GPU block in docker-compose.yml
 ```
 
-Verified live (2026-08-20) against this machine's own Docker + nvidia
-runtime: built image runs `torch.cuda.is_available() == True` *inside* the
-container, `/detect/image` correctly detects real objects (banana/apples on
-`../yolo/test.png`) via the GPU, and `CAMERA_BACKEND=realsense` with
+Verified live (2026-08-20): plain `docker compose up -d --build` (no GPU
+override, no env vars) starts cleanly on this machine and reports
+`YOLO_DEVICE=cpu` inside the container — confirms the base file genuinely
+doesn't require a GPU. Separately, `docker compose -f docker-compose.yml
+-f docker-compose.gpu.yml up -d --build` with `YOLO_DEVICE=0` against this
+machine's own nvidia runtime: `torch.cuda.is_available() == True` *inside*
+the container, `/detect/image` correctly detects real objects (banana/2
+apples on `../yolo/test.png`) via the GPU. `CAMERA_BACKEND=realsense` with
 `--privileged -v /dev/bus/usb:/dev/bus/usb` starts cleanly and returns a
 clean `503` (not a crash) when no RealSense happens to be attached — same
 graceful-degradation behavior as the plain-webcam path. Not yet verified:
 an actual RealSense detected *from inside* the container (none was attached
-to this sandbox when this was built — re-verify the moment one is).
+to this sandbox when this was built — re-verify the moment one is); CPU
+YOLO's actual inference latency inside a container (only the GPU path and
+the fact that `YOLO_DEVICE=cpu` is accepted have been exercised).
 
 ## API contract
 

@@ -1,0 +1,21 @@
+# Opt-in GPU override -- deliberately NOT merged into docker-compose.yml's
+# base service, because a `deploy.resources.reservations.devices` block
+# with `driver: nvidia` makes `docker compose up` hard-fail on any machine
+# without an nvidia GPU + nvidia-container-toolkit (confirmed: this is
+# Compose's actual behavior, not a hypothetical). Most teammates' laptops
+# don't have that, so the base file has to work without it.
+#
+# On a machine that DOES have an nvidia GPU (`nvidia-smi` works, `docker
+# info` lists an `nvidia` runtime -- true on this machine already):
+#
+#   YOLO_DEVICE=0 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+services:
+  vision-human-track:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

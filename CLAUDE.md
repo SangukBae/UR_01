@@ -143,8 +143,19 @@ Repo layout:
     resolves a CUDA-enabled build straight from PyPI (matches this venv's
     own `torch 2.13.0+cu130`), so no CUDA base image is needed, just the
     nvidia container runtime at `docker run`/`docker compose` time.
-  - `docker-compose.yml` adds `deploy.resources.reservations.devices`
-    (nvidia GPU passthrough for YOLO) and a commented-out
+  - `docker-compose.yml` defaults to `YOLO_DEVICE=cpu` and reserves no
+    GPU, so a plain `docker compose up -d --build` works on any machine --
+    important since most teammates won't have a GPU. GPU passthrough is a
+    separate opt-in file, `docker-compose.gpu.yml`
+    (`deploy.resources.reservations.devices`, nvidia), combined via
+    `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up`.
+    **This was originally baked into the base file and hard-failed
+    `docker compose up` on any machine without an nvidia GPU +
+    nvidia-container-toolkit** -- found live testing "how does a teammate
+    without a GPU run this," fixed by splitting it out; verified both the
+    plain base file (reports `YOLO_DEVICE=cpu` inside the container) and
+    the GPU-override combo (`torch.cuda.is_available()==True` inside the
+    container) against this machine. Also a commented-out
     `privileged: true` + `/dev/bus/usb` mount for RealSense USB passthrough
     (a RealSense isn't a single `/dev/video*` node, so the existing plain
     `--device` convention doesn't work for it -- see the file's own
