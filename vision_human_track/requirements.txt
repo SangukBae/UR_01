@@ -9,7 +9,17 @@ python-multipart==0.0.32
 starlette==1.6.0
 uvicorn==0.52.4
 
-# Only needed for live_demo.py --realsense (local GUI demo, not the Docker
-# API service -- an Intel RealSense needs direct USB/hardware access that
-# doesn't make sense to containerize here).
+# RealSense USB/hardware access (CAMERA_BACKEND=realsense) -- the container
+# needs /dev/bus/usb passed through (see docker-compose.yml) for this to
+# actually find a device; the package itself installs the same either way.
 pyrealsense2==2.58.3.10794
+
+# Object detection (YOLO_ENABLED=true) -- pulls a CUDA-enabled build
+# straight from PyPI (no extra --index-url needed, verified against this
+# repo's own venv: `pip show torch` requires nvidia-cudnn-cu13 etc. as
+# ordinary deps). Needs the container run with the nvidia runtime
+# (docker-compose.yml) to actually use a GPU; falls back to YOLO_DEVICE=cpu
+# otherwise, same as ../yolo/smoke_test.py's own default.
+torch==2.13.0
+torchvision==0.28.0
+ultralytics==8.4.123

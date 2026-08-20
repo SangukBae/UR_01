@@ -34,9 +34,10 @@ obstacle avoidance (also added 2026-08-20, see below). It does NOT cover:
 a real Digital Twin (3D visualization/mirrored simulation state — path
 checking and obstacle avoidance now exist, but there's no 3D scene view),
 object detection (a different teammate's module), or real spatial safety
-fencing (needs camera↔robot calibration, not built) — see "Known gaps" and
-the block-diagram cross-check below for the full picture of what's covered
-vs. not.
+fencing (an unverified camera↔flange calibration now exists — see
+`camera_tf_publisher.py` below — but nothing consumes it for real
+proximity yet) — see "Known gaps" and the block-diagram cross-check below
+for the full picture of what's covered vs. not.
 
 ## Status
 
@@ -76,8 +77,10 @@ Repo layout:
   skeleton + per-person ID (MediaPipe PoseLandmarker) and full 21-point
   hand skeleton + derived palm-center/orientation (MediaPipe HandLandmarker).
   This user's team assignment; object detection is a separate teammate's
-  module (`../yolo/`), not built here, but `live_demo.py --yolo` can run it
-  alongside for a combined demo. `live_demo.py` is a local-only live-camera
+  module (`../yolo/`), not built here as a model, but **is now folded into
+  this same REST endpoint** (added 2026-08-20, see below) rather than only
+  being a local-demo flag. `live_demo.py --yolo` still runs it alongside
+  for a combined GUI demo. `live_demo.py` is a local-only live-camera
   GUI preview (not part of the API) — `--realsense` points it at an
   attached Intel RealSense (`src/realsense_camera.py`, via pyrealsense2)
   instead of a plain `cv2.VideoCapture` index. With `--realsense`, every
@@ -93,7 +96,80 @@ Repo layout:
   the API contract and known gaps (handedness sign convention still not
   empirically verified, person-ID stability shakier than intended,
   RealSense frames come out ~90° rotated since it's mounted vertically on
-  the robot arm).
+  the robot arm). `live_demo.py --yolo` used to silently run on CPU with
+  the smallest YOLO26 model regardless of hardware -- it now reads
+  `YOLO_DEVICE` (GPU index, e.g. `0`) and `YOLO_MODEL` (e.g. `yolo26x.pt`)
+  env vars, same convention `../yolo/smoke_test.py` already used, see
+  "Verified findings" below for GPU benchmarks on this machine.
+  `live_demo_rtdetr.py` (added 2026-08-20) is a parallel copy of
+  `live_demo.py` with identical camera/`--realsense`/`--ros2` handling,
+  but its object-detection overlay is `ultralytics.RTDETR` (`--detect`
+  flag, `RTDETR_DEVICE`/`RTDETR_MODEL` env vars, default `rtdetr-x.pt`)
+  instead of `../yolo/`'s YOLO26 -- a different (transformer-based)
+  detector architecture to compare against YOLO26, not a replacement for
+  it; both scripts share `../yolo/smoke_test.py`'s `serialize_detections`/
+  `plot_instance_names` since RT-DETR's `ultralytics.Results` output has
+  the same `.boxes` shape YOLO's does. `src/distance_utils.py` (added
+  2026-08-20) holds `add_distances`/`hand_pixel`, previously duplicated
+  between `live_demo.py` and `live_demo_rtdetr.py` -- both scripts, plus
+  `api.py` and `realsense_vision_node.py`, now import the one copy.
+
+  **Modular Docker container (added 2026-08-20).** A team integration
+  review found this service's Docker packaging didn't actually meet the
+  team's own agreed convention (Docker Compose + HTTP REST endpoint,
+  pluggable into the wider pipeline) -- the built image was human/hand-only
+  smoke-test-level (plain webcam, no object detection, no RealSense), while
+  the only implementation that actually combined RealSense + YOLO + human/
+  hand (`realsense_vision_node.py`, below) has no REST endpoint at all --
+  it owns the camera directly and only speaks ROS2 topics. That mismatch
+  (a teammate expecting to find a server endpoint per the agreed
+  convention, but getting "it's a ROS topic publisher" instead) was the
+  actual root cause of the friction. Fixed by extending `src/api.py`
+  itself, not by building a third parallel path:
+  - `CAMERA_BACKEND` env var (`cv2` default, or `realsense` --
+    `src/realsense_camera.py`'s `RealSenseCapture`, real `distance_m` on
+    every hand/object, ignores the `camera_index` query param).
+  - `YOLO_ENABLED`/`YOLO_DEVICE`/`YOLO_MODEL` env vars fold `../yolo/`'s
+    object detection into both `/detect/image` and `/detect/live`'s
+    response (`objects` array + `frame_width`/`frame_height`), reusing
+    `../yolo/smoke_test.py`'s `serialize_detections` rather than
+    duplicating it -- the same REST endpoint now does both detectors, per
+    the team's convention, instead of them living in different processes.
+  - `Dockerfile` build context moved to the repo root (`docker-
+    compose.yml`'s `build.context: ..`) so it can `COPY yolo/smoke_test.py`
+    in; added `libusb-1.0-0`/`libudev1` (pyrealsense2's runtime deps) and
+    `torch`/`torchvision`/`ultralytics` to `requirements.txt` -- verified
+    live that plain `pip install torch==2.13.0` (no special `--index-url`)
+    resolves a CUDA-enabled build straight from PyPI (matches this venv's
+    own `torch 2.13.0+cu130`), so no CUDA base image is needed, just the
+    nvidia container runtime at `docker run`/`docker compose` time.
+  - `docker-compose.yml` adds `deploy.resources.reservations.devices`
+    (nvidia GPU passthrough for YOLO) and a commented-out
+    `privileged: true` + `/dev/bus/usb` mount for RealSense USB passthrough
+    (a RealSense isn't a single `/dev/video*` node, so the existing plain
+    `--device` convention doesn't work for it -- see the file's own
+    comments for why `privileged` is the pragmatic choice here).
+  - `ros2_vision_bridge/vision_bridge_node.py` now also relays an
+    `/vision/objects_json` topic when the polled REST response carries
+    `objects` -- no per-object TF there, though (this node never owns the
+    camera, so it has no `deproject()`/intrinsics; use
+    `realsense_vision_node.py` directly for that).
+
+  **Verified live** (this machine's own Docker + already-registered
+  `nvidia` container runtime): image builds and runs; `torch.
+  cuda.is_available()` is `True` *inside* the container; `/detect/image`
+  correctly detects real objects (banana/2 apples on `../yolo/test.png`)
+  via the GPU; `CAMERA_BACKEND=realsense` with `--privileged -v
+  /dev/bus/usb:/dev/bus/usb` starts cleanly and `/detect/live` returns a
+  clean `503` (not a crash) when no RealSense is attached -- matches this
+  sandbox's actual state (no RealSense attached to the host either right
+  now, confirmed via the venv's own `pyrealsense2.context().query_devices()`
+  returning empty). **Not yet verified**: an actual RealSense detected
+  *from inside* the container (none was attached to this sandbox when this
+  was built); `vision_bridge_node.py`'s new `/vision/objects_json` relay
+  end-to-end (needs a live camera behind the REST service, which the
+  plain `cv2` backend can't get without a `/dev/video0` device mapped into
+  the container -- commented out by default in `docker-compose.yml`).
 - `ros2_vision_bridge/` — two plain rclpy scripts (no colcon package,
   matches `ros2_ur_driver/`'s convention), same output topics either way.
   `vision_bridge_node.py` polls `vision_human_track`'s `/detect/live` and
@@ -110,9 +186,37 @@ Repo layout:
   set — no separate node needed if you also want to see the picture (the
   two scripts still can't run at once, though — one camera, one process).
   Both bridge scripts share their message-building code
-  (`vision_bridge_node.py`'s `build_hands_msg`/`build_markers_msg`, and
-  `live_demo.py`'s `add_distances`), so any existing consumer works
-  unchanged regardless of which one is running. `cyclonedds_localhost.xml`
+  (`vision_bridge_node.py`'s `build_hands_msg`/`build_markers_msg`/
+  `build_object_tfs`, and `live_demo.py`'s `add_distances`), so any
+  existing consumer works unchanged regardless of which one is running.
+
+  **`camera_tf_publisher.py`** (added 2026-08-20) publishes the camera's
+  fixed mount as a static TF, `flange -> camera_optical_frame`, from a
+  teammate-supplied rotation/translation measurement (`CAMERA_R`/
+  `CAMERA_T`). `realsense_vision_node.py` and `live_demo.py --realsense
+  --ros2` (the latter importing the same constants, not duplicating them)
+  additionally publish a dynamic `camera_optical_frame -> object_<name>`
+  TF per YOLO detection with valid depth, via `RealSenseCapture.deproject`
+  (pixel + `distance_m` -> a real metric 3D point using the color stream's
+  intrinsics) — this is the piece that finally closes `flange -> object`
+  for real spatial reasoning, not just presence detection. Two real bugs
+  found and fixed building this: (1) the literal `CAMERA_R` relayed by the
+  teammate had `det = -1` (a reflection, not a rotation, so it has no
+  quaternion) — `geometry.py`'s new `matrix_to_quaternion` now validates
+  orthogonality + det=+1 and raises a clear error instead of silently
+  publishing something wrong; (2) the frame was almost named `camera_link`
+  (ROS's usual physical-mount convention, X-forward) when `CAMERA_R` is
+  actually defined in the optical convention (Z-forward, matching
+  `deproject()`'s own output) — named `camera_optical_frame` instead to
+  avoid a silent 90°-ish mismatch. The corrected sign was disambiguated
+  using `/opt/ros/humble/share/ur_description/urdf/ur_macro.xacro` (flange
+  +X is the ROS-Industrial standard "front"/tool-forward direction) plus a
+  user-provided photo of the real mount (RealSense extends coaxially
+  outward from wrist_3). **Still not empirically confirmed against a real
+  depth reading** — see `ros2_vision_bridge/README.md`'s verification
+  steps before trusting it for anything safety-critical.
+
+  `cyclonedds_localhost.xml`
   is an opt-in CycloneDDS config that fixes this sandbox's DDS-discovery
   hang for vision-only work — see "Verified findings" below, do NOT set it
   globally. Also has `safety_stop_demo.py`
@@ -120,7 +224,10 @@ Repo layout:
   presence, closing the vision→ROS2→robot-stop loop end to end (talks to
   the robot directly, not through the MCP layer — a safety reaction
   shouldn't go through an LLM tool-call loop). A presence trigger, not
-  real spatial fencing — no camera↔robot calibration exists yet. See its
+  real spatial fencing — still doesn't consume the new `flange -> object`
+  TF chain above (that calibration exists now, in principle, but is
+  unverified — see `camera_tf_publisher.py` above — and nothing subscribes
+  to it yet to compute actual proximity). See its
   README for the hand-off caveats (what a teammate needs on their own
   machine, which varies a lot by OS) and known gaps (DDS discovery is
   flaky in this sandbox — same class of issue as `ros2_ur_driver/
@@ -402,6 +509,27 @@ local Whisper) and adds spoken replies via `tts.py` (`espeak-ng` →
   reading against an object at an actually-known distance — treat the
   *numbers* as unverified until that specific check happens, even though
   the plumbing clearly works.
+- **This machine has a real CUDA GPU that `--yolo` wasn't using (found
+  2026-08-20).** `vision_human_track/venv` already has CUDA-enabled torch
+  (`torch 2.13.0+cu130`, `torch.cuda.is_available()` True) against an
+  RTX 3060 Laptop GPU (6GB VRAM, compute capability 8.6) — but
+  `live_demo.py --yolo` defaulted `YOLO_DEVICE` to `"cpu"` and hardcoded
+  the model to `yolo26n.pt` with no way to override either, so the GPU
+  sat idle. Fixed (see the `vision_human_track/` repo-layout entry above).
+  Benchmarked every YOLO26 size and both RT-DETR sizes on this GPU with a
+  single warm frame (`../yolo/test.png`) — all comfortably real-time and
+  nowhere near the 6GB budget:
+  YOLO26 n/s/m/l/x ≈ 38/25/29/33/48ms, 40–261MB VRAM;
+  RT-DETR l/x ≈ 63/48ms, 165–261MB VRAM.
+  Practical takeaway: model-size choice isn't GPU-constrained on this
+  machine at all (`yolo26x`/`rtdetr-x`, the largest of each family, are
+  both trivially fast) — the actual bottleneck in `live_demo.py`'s loop
+  is the CPU-run MediaPipe pose/hand inference happening every frame
+  alongside it, not YOLO/RT-DETR's own compute cost. Also: Ultralytics
+  only ships pretrained weights for two RT-DETR sizes (`rtdetr-l.pt`,
+  `rtdetr-x.pt`) — the `rtdetr-resnet50`/`rtdetr-resnet101` configs exist
+  in the package but aren't available as ready pretrained checkpoints,
+  unlike YOLO26's full n/s/m/l/x lineup.
 
 ## Team repo sync (tom-bourjala/UR-MCP)
 
@@ -478,10 +606,13 @@ planning scene *is* an internal one now, but there's no visualization or
 external mirroring of it); `Environment Shadow` in the diagram's strict
 sense (`get_environment_shadow` is a cache of vision+state, not a 3D map);
 `ObjectID`/`grab_object`/`place_object`/`give_object` (no object-detection
-model — different teammate's task); real spatial `Safety` (needs
-camera↔robot calibration — `safety_stop_demo.py` only reacts to hand
-*presence*, not real proximity, and obstacles in the new planning scene are
-added manually via `add_obstacle`, not auto-populated from vision yet);
+model — different teammate's task); real spatial `Safety` (a camera↔flange
+calibration now exists in principle — `ros2_vision_bridge/
+camera_tf_publisher.py`, see its repo-layout entry above — but is
+unverified and unconsumed: `safety_stop_demo.py` still only reacts to hand
+*presence*, not real proximity via that TF, and obstacles in the planning
+scene are added manually via `add_obstacle`, not auto-populated from
+vision yet);
 `program_new`/`program_delete`/`program_start`/`program_stop` were blue but
 ARE now built (named waypoint sequences); `track` was blue and is now built
 but deliberately crude (1-DOF, no calibration) — see its docstring.
@@ -692,8 +823,14 @@ python3 tests/test_math.py && python3 tests/test_smoke.py && python3 tests/test_
 docker compose up -d --build && curl http://localhost:8000/health
 python3 live_demo.py                                   # live GUI, needs a camera + display
 python3 live_demo.py --realsense --yolo                 # RealSense camera + object detection (+ distance_m)
-python3 live_demo.py --realsense --yolo --ros2           # same, AND publishes all 4 /vision/* topics at once
+python3 live_demo.py --realsense --yolo --ros2           # same, AND publishes all 4 /vision/* topics
+                                                          # + TF (flange -> camera_optical_frame static,
+                                                          # camera_optical_frame -> object_<name> per object)
                                                           # (needs /opt/ros/humble/setup.bash + RMW_IMPLEMENTATION first)
+YOLO_DEVICE=0 YOLO_MODEL=yolo26x.pt python3 live_demo.py --yolo   # GPU + largest YOLO26 model
+                                                          # (defaults are cpu + yolo26n.pt if unset -- see Verified findings)
+RTDETR_DEVICE=0 python3 live_demo_rtdetr.py --detect      # same idea, RT-DETR instead of YOLO26
+                                                          # (RTDETR_MODEL default rtdetr-x.pt, or rtdetr-l.pt)
 
 # ROS2 bridge: republishes the Vision Stack as topics
 cd ros2_vision_bridge
@@ -701,7 +838,9 @@ python3 tests/test_geometry.py                          # plain python3, no ROS 
 source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"   # optional, fixes flaky discovery - see Verified findings
 python3 vision_bridge_node.py                            # polls vision_human_track's REST API (needs it running above)
-python3 realsense_vision_node.py                         # OR: owns a RealSense directly, no REST API needed, adds /vision/objects_json
+python3 realsense_vision_node.py                         # OR: owns a RealSense directly, no REST API needed, adds /vision/objects_json + object TFs
+python3 camera_tf_publisher.py                            # standalone flange -> camera_optical_frame static TF
+                                                          # (not needed alongside live_demo.py --realsense --ros2, which publishes it itself)
 python3 safety_stop_demo.py                              # closes the loop: hand -> stop_robot (works with either bridge above)
 ```
 

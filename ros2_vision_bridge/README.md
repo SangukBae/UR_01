@@ -5,10 +5,17 @@ there, same output topics either way:
 
 - **`vision_bridge_node.py`** — bridges `vision_human_track`'s HTTP REST
   service into ROS2 topics, so any ROS2 node (obstacle avoidance, digital
-  twin, safety fencing) can consume human/hand detections without knowing
-  it's a plain HTTP service under the hood. Polls `POST /detect/live` on a
-  timer and republishes the JSON as ROS2 messages. Works with whatever
-  camera `vision_human_track` happens to have (typically a plain webcam).
+  twin, safety fencing) can consume human/hand (and, since 2026-08-20,
+  object) detections without knowing it's a plain HTTP service under the
+  hood. Polls `POST /detect/live` on a timer and republishes the JSON as
+  ROS2 messages. Works with whatever camera/detector mix
+  `vision_human_track` happens to be running — including a RealSense +
+  YOLO, via that service's own `CAMERA_BACKEND`/`YOLO_ENABLED` env vars
+  (see its README's "Modular deployment") — this node itself doesn't care,
+  it only ever talks to the REST endpoint. This is the recommended default:
+  it's the team's actual agreed integration point (Docker Compose + HTTP
+  REST), and doesn't need this node's own machine to have ROS2 *and*
+  MediaPipe *and* YOLO *and* the camera all installed together.
 - **`realsense_vision_node.py`** — talks to an attached Intel RealSense
   directly via `pyrealsense2` and runs detection in-process, no REST
   service needed. Adds object detection (YOLO, a teammate's `../yolo/`
@@ -105,6 +112,63 @@ no-data-yet all covered, see `vision_human_track/README.md`'s known gaps.
 Re-verify `distance_m` against a real object at a known distance once the
 camera is reattached.
 
+## camera_tf_publisher.py + per-object TFs — camera↔flange calibration
+
+Two pieces that together turn `realsense_vision_node.py`'s object
+detections into real, robot-frame-composable poses via TF2, instead of
+just camera-relative pixel/distance numbers in JSON:
+
+- **`camera_tf_publisher.py`** — a `StaticTransformBroadcaster` publishing
+  the camera's fixed mounting pose, `flange -> camera_optical_frame`, once
+  (latched). The rotation/translation are a teammate-supplied measurement
+  of the RealSense's mount on the robot's flange. Named
+  `camera_optical_frame`, not the more common ROS `camera_link`, because
+  the rotation is defined directly in the camera's optical convention (X
+  right, Y down, Z forward — same as `RealSenseCapture.deproject()`'s
+  output), not the REP-103 physical-mount convention `camera_link` usually
+  implies (X forward, Y left, Z up) — see the comment above `CAMERA_R` in
+  the script.
+- **`realsense_vision_node.py`**'s `_publish_object_tfs` — every tick,
+  publishes a `TransformBroadcaster` (dynamic) TF for each YOLO object with
+  a valid depth reading: `camera_optical_frame -> object_<instance_name>`
+  (e.g. `object_cup1`), translation = the real 3D point from
+  `RealSenseCapture.deproject` (pixel + `distance_m` -> metric X/Y/Z via
+  the color stream's intrinsics, `rs2_deproject_pixel_to_point`), rotation
+  = identity (a 2D detector has no orientation estimate, so the object
+  frame is just axis-aligned to the camera).
+
+Chained together, any TF2 consumer gets an object's pose directly in the
+flange frame for free — `flange -> camera_optical_frame -> object_cup1` —
+no extra code needed on the consuming side.
+
+```bash
+source /opt/ros/humble/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+python3 camera_tf_publisher.py                  # once, stays running (static/latched)
+python3 realsense_vision_node.py                 # per-object TFs come along with the existing topics
+```
+
+**`CAMERA_R`'s mounting rotation, as literally relayed by a teammate, had
+det = -1 — a reflection, not a proper rotation** (`geometry.py`'s
+`matrix_to_quaternion` catches exactly this class of error, raising a
+clear `ValueError` instead of silently publishing something wrong).
+Almost certainly a single mistyped sign; disambiguated 2026-08-20 using
+`/opt/ros/humble/share/ur_description/urdf/ur_macro.xacro` (ROS-
+Industrial's standard UR description — flange's own +X is the documented
+"front"/tool-forward direction) plus a photo of the real mount (RealSense
+extends straight out from wrist_3 in that same outward direction) — see
+the comment above `CAMERA_R` in `camera_tf_publisher.py` for the full
+derivation. **Still not empirically confirmed against a real depth
+reading** — verify once with a real object: place something on the side
+the camera looks (away from the robot body), run `realsense_vision_node.py`,
+and check with `ros2 run tf2_ros tf2_echo flange object_<name>` that the
+reported position actually matches where the object physically is.
+
+This is also the calibration piece `safety_stop_demo.py`'s "Known gaps"
+section below says doesn't exist yet — once `CAMERA_R` is empirically
+confirmed, real spatial (not just presence-based) safety fencing becomes
+possible for the first time.
+
 ## Topics published
 
 | Topic | Type | Contents | Published by |
@@ -112,7 +176,7 @@ camera is reattached.
 | `/vision/hands` | `geometry_msgs/PoseArray` | One `Pose` per detected hand: `position` = palm center, `orientation` = a quaternion whose local +Z axis points along the palm normal (see `geometry.py`'s `quat_from_z_axis` docstring — this fixes 2 of 3 rotational DOF, not the hand's roll). | both |
 | `/vision/humans_markers` | `visualization_msgs/MarkerArray` | One `LINE_LIST` marker per detected person (simplified limb/torso skeleton) — viewable directly in RViz, zero custom-message parsing needed. | both |
 | `/vision/humans_json` | `std_msgs/String` | The vision service's raw JSON response, one message per poll/frame — full 33-point skeleton, all 21 hand landmarks per hand, IDs, unassigned hands. Everything the two typed topics above don't carry, without needing a custom `.msg` package. On `realsense_vision_node.py`, each hand also carries a real `distance_m` (metres, from the aligned depth sensor; `null` if no valid depth at that pixel). | both |
-| `/vision/objects_json` | `std_msgs/String` | `{"objects": [...], "frame_width": W, "frame_height": H}` — one YOLO detection per object (`class_name`, `instance_name`, `confidence`, pixel `xyxy` box, and a real `distance_m` at the box center — same depth source/caveats as `/vision/hands`' `distance_m`). `realsense_vision_node.py` only. | `realsense_vision_node.py` only |
+| `/vision/objects_json` | `std_msgs/String` | `{"objects": [...], "frame_width": W, "frame_height": H}` — one YOLO detection per object (`class_name`, `instance_name`, `confidence`, pixel `xyxy` box, and a real `distance_m` at the box center — same depth source/caveats as `/vision/hands`' `distance_m`). | both, but `vision_bridge_node.py` only if `vision_human_track` was started with `YOLO_ENABLED=true` — see below |
 
 **Coordinate frame**: everything is in the vision service's own output
 frame — camera-relative, normalized `[0,1]` image x/y for hands/skeleton
@@ -120,6 +184,14 @@ frame — camera-relative, normalized `[0,1]` image x/y for hands/skeleton
 **Not** robot/world coordinates. Per the team's first architecture
 meeting, transforming this into robot coordinates is a separate ROS-side
 job, deliberately not done here.
+
+**`vision_bridge_node.py`'s `/vision/objects_json` has no accompanying
+TF**, unlike `realsense_vision_node.py`'s per-object TF (see below) — this
+node never owns the camera itself, so it has no depth-sensor intrinsics/
+`deproject()` to turn a pixel + `distance_m` into a real 3D point, only
+whatever `vision_human_track`'s REST response already carries (2D box +
+scalar distance). Use `realsense_vision_node.py` directly if you need the
+`flange -> object_<name>` TF chain.
 
 ## Verified live (2026-08-19)
 

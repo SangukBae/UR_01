@@ -1,14 +1,25 @@
-# vision_human_track — Human Detection & Hand Tracking
+# vision_human_track — Human Detection & Hand Tracking (+ Object Detection)
 
-Team's shared Vision Stack: this service is the "Human Detection & Hand
-Tracking" half (SANGUK BAE's assignment from the 2nd team meeting). Object
-detection (apple/cup/etc.) is a separate teammate's module — not built here.
+Team's shared Vision Stack, packaged as **the** modular plug-in container
+for the rest of the pipeline — per the team's agreed convention (Docker
+Compose + HTTP REST POST endpoints), this is the one place another module
+(MCP passthrough, `ros2_vision_bridge`, anything else) should talk to for
+person/hand/object detections. It does not assume a specific camera or
+deployment host: `CAMERA_BACKEND` picks a plain UVC webcam or an attached
+Intel RealSense (real depth), and `YOLO_ENABLED` folds in object detection
+(a teammate's YOLO26 model, `../yolo/`) alongside this service's own
+human/hand detection (SANGUK BAE's assignment from the 2nd team meeting) —
+**one container, one endpoint, both detectors** — see "Modular deployment"
+below for the exact knobs. Runs real-time on this machine's GPU (see
+"Running it").
 
 Detects people in a frame (skeleton + a per-person ID across frames) and,
 for each detected hand, the full 21-point finger-joint skeleton plus a
 derived palm center point and orientation (a unit normal vector) — not
 full gesture/sign-language recognition, just enough for robot-interaction
-and safety-fencing use cases.
+and safety-fencing use cases. With `YOLO_ENABLED=true`, every response also
+carries an `objects` array (bounding boxes + class) from the teammate's
+YOLO26 model.
 
 See [`../ros2_vision_bridge/`](../ros2_vision_bridge/) for the ROS2 side
 that republishes this service's output as topics.
@@ -35,12 +46,30 @@ below, not a large multi-person test set).
   local camera — 503 if none attached). `GET /health`. The camera is opened
   once and kept open across `/detect/live` calls, not reopened per request
   (see Known gaps — reopening every time was both slow and silently broken).
+  `CAMERA_BACKEND` env var picks `cv2` (default, any UVC webcam via
+  `camera_index`) or `realsense` (an attached Intel RealSense via
+  `src/realsense_camera.py`'s `RealSenseCapture`, real `distance_m` on
+  every hand/object, ignores `camera_index`). `YOLO_ENABLED=true` loads
+  `../yolo/`'s YOLO26 model at startup and adds an `objects` array to every
+  response (`YOLO_DEVICE`/`YOLO_MODEL` env vars pick the compute device/
+  model size, same convention `live_demo.py --yolo` already uses).
+- `src/distance_utils.py` — `add_distances()`: fills in a real `distance_m`
+  (metres) on every hand/object from a RealSense's depth sensor. Shared by
+  `api.py`, `live_demo.py`, `live_demo_rtdetr.py`, and
+  `../ros2_vision_bridge/realsense_vision_node.py` — one implementation,
+  not four copies.
 - `Dockerfile` + `docker-compose.yml` — per the team's agreed convention,
   packaged as a standalone HTTP service for the ROS/MCP bridge to call.
-  `download_models.sh` runs as part of the image build (and can be run
-  standalone for local dev) so `models/*.task` (~13MB, gitignored) never
-  needs to be committed or hand-carried — a plain `git clone` +
+  Build context is the repo root (`..`), not this directory, so the
+  Dockerfile can also pull in `../yolo/smoke_test.py` for the `objects`
+  path above. `download_models.sh` runs as part of the image build (and can
+  be run standalone for local dev) so `models/*.task` (~13MB, gitignored)
+  never needs to be committed or hand-carried — a plain `git clone` +
   `docker compose up -d --build` is enough for anyone to reproduce this.
+  GPU passthrough (`deploy.resources.reservations.devices`, nvidia) and
+  RealSense USB passthrough (`privileged` + `/dev/bus/usb` mount, commented
+  out by default) are both in `docker-compose.yml` — see "Modular
+  deployment" below.
 - `live_demo.py` — local-only GUI demo (not part of the API), opens a
   camera and shows the detection overlay in a live window (`q` to quit).
   Needs the non-headless `opencv-contrib-python` this venv already has
@@ -63,15 +92,56 @@ Output is in **camera-frame, normalized [0,1] image coordinates** (plus
 MediaPipe's relative z). Converting these to robot/world coordinates is
 ROS's job, per the team's first architecture meeting — not handled here.
 
+## Modular deployment
+
+The one supported integration point is this REST API — not a shared
+library, not a ROS node someone else has to also run. `docker-compose.yml`
+exposes every knob as an env var so a deployer picks the camera/detector
+mix without touching code:
+
+| env var          | default    | meaning                                                          |
+|-------------------|-----------|-------------------------------------------------------------------|
+| `CAMERA_BACKEND`  | `cv2`      | `cv2` (any UVC webcam) or `realsense` (Intel RealSense, real depth) |
+| `YOLO_ENABLED`    | `true`     | fold in the teammate's YOLO26 object detection                    |
+| `YOLO_DEVICE`     | `0`        | GPU index for YOLO, or `cpu`                                      |
+| `YOLO_MODEL`      | `yolo26n.pt` | which YOLO26 size (`n/s/m/l/x`) — baked into the image at build time via the matching `--build-arg` |
+
+```bash
+# Zero-hardware default: human/hand + object detection, cv2 camera backend,
+# GPU YOLO -- works out of the box for anyone without a RealSense attached.
+docker compose up -d --build
+
+# The real deployment target -- RealSense mounted on the robot arm.
+# Uncomment `privileged`/`/dev/bus/usb` in docker-compose.yml first (see
+# the comments there for why -- a RealSense isn't a single /dev/video*
+# node, so a plain --device mapping doesn't work), then:
+CAMERA_BACKEND=realsense docker compose up -d --build
+
+# CPU-only YOLO (no nvidia-container-toolkit on the host):
+YOLO_DEVICE=cpu docker compose up -d --build   # also remove the deploy.resources
+                                                 # GPU block in docker-compose.yml
+```
+
+Verified live (2026-08-20) against this machine's own Docker + nvidia
+runtime: built image runs `torch.cuda.is_available() == True` *inside* the
+container, `/detect/image` correctly detects real objects (banana/apples on
+`../yolo/test.png`) via the GPU, and `CAMERA_BACKEND=realsense` with
+`--privileged -v /dev/bus/usb:/dev/bus/usb` starts cleanly and returns a
+clean `503` (not a crash) when no RealSense happens to be attached — same
+graceful-degradation behavior as the plain-webcam path. Not yet verified:
+an actual RealSense detected *from inside* the container (none was attached
+to this sandbox when this was built — re-verify the moment one is).
+
 ## API contract
 
 ```
 POST /detect/image   multipart form field "file" = image bytes
-POST /detect/live     optional query param "camera_index" (default 0)
+POST /detect/live     optional query param "camera_index" (default 0, ignored for CAMERA_BACKEND=realsense)
 GET  /health
 ```
 
-Response shape:
+Response shape (`objects` only present with `YOLO_ENABLED=true`;
+`distance_m` only present with `CAMERA_BACKEND=realsense`):
 ```json
 {
   "humans": [
@@ -81,12 +151,21 @@ Response shape:
       "hands": [
         {
           "handedness": "Right", "palm_center": [x,y,z], "normal": [nx,ny,nz],
-          "landmarks": [{"x":.., "y":.., "z":..}, ...21 pts, wrist + 4 joints/finger]
+          "landmarks": [{"x":.., "y":.., "z":..}, ...21 pts, wrist + 4 joints/finger],
+          "distance_m": 1.42
         }
       ]
     }
   ],
-  "unassigned_hands": [ ...same shape as a hand entry, no matching pose... ]
+  "unassigned_hands": [ ...same shape as a hand entry, no matching pose... ],
+  "frame_width": 640,
+  "frame_height": 480,
+  "objects": [
+    {
+      "class_id": 47, "class_name": "apple", "instance_name": "apple1",
+      "confidence": 0.669, "xyxy": [44.6, 25.2, 314.4, 288.1], "distance_m": 0.87
+    }
+  ]
 }
 ```
 
@@ -121,29 +200,35 @@ normalized [0,1] image coordinates + relative depth** (this is the
   real hand of known orientation).
 - **`id`** (per human): a tracking ID across frames/calls, not a
   coordinate — see Known gaps for its stability caveats.
-- **`distance_m`** (hands only, `live_demo.py --realsense` and
-  `../ros2_vision_bridge/realsense_vision_node.py` only): real depth in
-  metres at the palm center's pixel, from the RealSense's depth sensor —
-  the one field here that ISN'T normalized/relative, a genuine metric
-  measurement. `None`/`null` if no valid depth was available there (out of
-  the sensor's ~0.2-10m range, a reflective/dark surface, etc.). Not
-  present at all on plain-webcam runs — there's no depth sensor to read.
+- **`distance_m`** (hands only): real depth in metres at the palm center's
+  pixel, from the RealSense's depth sensor — the one field here that ISN'T
+  normalized/relative, a genuine metric measurement. Present on
+  `CAMERA_BACKEND=realsense` (the REST API itself, both endpoints), plus
+  `live_demo.py --realsense` and `../ros2_vision_bridge/
+  realsense_vision_node.py`. `None`/`null` if no valid depth was available
+  there (out of the sensor's ~0.2-10m range, a reflective/dark surface,
+  etc.). Not present at all on `CAMERA_BACKEND=cv2`/plain-webcam runs —
+  there's no depth sensor to read.
 
-**`detect_photo.py --yolo`'s `"objects"` array — raw pixel coordinates,
-a different frame entirely:**
+**`objects[]` (`YOLO_ENABLED=true`) — raw pixel coordinates, a different
+frame entirely:**
 
 - **`xyxy`**: `[x1, y1, x2, y2]` bounding box corners in the ORIGINAL
   IMAGE'S PIXELS (e.g. `2108.0` for a ~2000px-wide photo) — not
   normalized to [0,1] like everything above. Values over 1 are the
-  giveaway if you're not sure which array you're looking at.
-- This array only appears via `detect_photo.py --yolo` (a local
-  convenience script combining this service's own output with a
-  teammate's separate YOLO module for one still image) — it is NOT part
-  of `/detect/image` or `/detect/live`'s response; the actual REST API
-  never returns object detections (see "Object detection is intentionally
-  not here" in Known gaps). `live_demo.py --realsense --yolo` and
-  `realsense_vision_node.py` also add a `distance_m` field to each object
-  (bounding-box-center pixel), same meaning as the hands' field above.
+  giveaway if you're not sure which array you're looking at. Use the
+  response's own `frame_width`/`frame_height` to interpret them, not an
+  assumed resolution.
+- Present directly on `/detect/image` and `/detect/live` when the service
+  was started with `YOLO_ENABLED=true` (see "Modular deployment" above) —
+  this is the team's single agreed integration point for object
+  detection, same endpoint as human/hand detection, not a separate
+  service or a local-only script. `detect_photo.py --yolo` (a local
+  single-image CLI convenience, not part of the API) and `live_demo.py
+  --yolo`/`--realsense --yolo` produce the same shape for eyeballing on a
+  still photo or a live GUI window. Each object also gets `distance_m`
+  (bounding-box-center pixel) when the camera backend is `realsense`,
+  same meaning as the hands' field above.
 
 ## WSL2: attach a USB webcam first
 
@@ -189,7 +274,8 @@ pip install -r requirements.txt
 ./download_models.sh   # fetches models/*.task (~13MB, not committed to git)
 cd src && uvicorn api:app --host 0.0.0.0 --port 8000
 
-# Docker (matches the team's packaging convention):
+# Docker (matches the team's packaging convention) -- see "Modular
+# deployment" above for CAMERA_BACKEND/YOLO_ENABLED/YOLO_DEVICE/YOLO_MODEL:
 docker compose up -d --build
 curl http://localhost:8000/health
 
@@ -290,5 +376,21 @@ normal-vector arrows pointing in a geometrically plausible direction.
   fixed — don't trust the `id` field to stay constant over more than a
   few seconds without re-checking this, especially with multiple real
   people (still never tested).
-- **Object detection is intentionally not here** — separate teammate's
-  module per the 2nd team meeting.
+- **Object detection now IS here (2026-08-20)** — folded into this same
+  REST endpoint via `YOLO_ENABLED=true` (still a teammate's YOLO26 model,
+  `../yolo/`, reused as-is via `../yolo/smoke_test.py`'s
+  `serialize_detections`, not reimplemented). Earlier versions of this
+  README said the API deliberately never returns object detections — that
+  was true until the team's Docker/integration review found the
+  REST-endpoint convention and object detection weren't actually meeting
+  at one integration point yet; fixed by combining both detectors behind
+  the one endpoint the team already agreed on. See "Modular deployment"
+  above.
+- **RealSense-in-Docker: passthrough verified, no live device tested.**
+  `--privileged -v /dev/bus/usb:/dev/bus/usb` gets `pyrealsense2` inside
+  the container talking to the host's USB bus at all (confirmed:
+  `list_realsense_devices()` runs without error and correctly reports zero
+  devices, matching this sandbox's actual state) — but no RealSense was
+  physically attached to this sandbox when this was built, so an actual
+  in-container detection has not been run. Re-verify with a real device
+  attached before trusting this for the robot cell.

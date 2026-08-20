@@ -1,11 +1,52 @@
 services:
   vision-human-track:
-    build: .
+    build:
+      # Repo root, not this directory -- the Dockerfile also pulls in
+      # ../yolo/smoke_test.py (a teammate's object-detection module).
+      context: ..
+      dockerfile: vision_human_track/Dockerfile
+      args:
+        YOLO_ENABLED: "true"
+        YOLO_MODEL: "${YOLO_MODEL:-yolo26n.pt}"
     container_name: ur01-vision-human-track
     ports:
       - "8000:8000"
-    # Uncomment to pass a local camera device through on native Linux.
-    # WSL2 needs the device attached via usbipd first - see README.
+    environment:
+      # "cv2" (any UVC webcam) or "realsense" (Intel RealSense, needs the
+      # USB passthrough below attached and uncommented). RealSense is the
+      # real deployment target (the camera mounted on the robot arm);
+      # cv2 is the zero-hardware-assumption default so this still builds
+      # and runs for anyone without one attached, e.g. CI or a teammate
+      # integrating against /detect/image only.
+      CAMERA_BACKEND: "${CAMERA_BACKEND:-cv2}"
+      YOLO_ENABLED: "${YOLO_ENABLED:-true}"
+      YOLO_DEVICE: "${YOLO_DEVICE:-0}"
+      YOLO_MODEL: "${YOLO_MODEL:-yolo26n.pt}"
+    # GPU passthrough for YOLO (YOLO_DEVICE=0) -- needs nvidia-container-
+    # toolkit on the host (already present on this machine: `docker info`
+    # lists an `nvidia` runtime). Falls back cleanly to CPU if this block
+    # is removed and YOLO_DEVICE is set to "cpu" instead.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # RealSense USB passthrough (CAMERA_BACKEND=realsense above). Uncomment
+    # both lines below -- privileged is the simplest reliable way to get a
+    # RealSense's USB bulk-transfer endpoints into a container (a plain
+    # --device list needs per-device rules that change on replug; a real
+    # RealSense also isn't a single /dev/video* node, see
+    # src/realsense_camera.py). On WSL2, the device must already be
+    # attached to the Linux side first via usbipd-win -- see README.md.
+    # Leave commented out for CAMERA_BACKEND=cv2 (no camera hardware
+    # access needed at all beyond whatever /dev/video0 mapping you add).
+    # privileged: true
+    # volumes:
+    #   - /dev/bus/usb:/dev/bus/usb
+    # Uncomment to pass a plain webcam through instead (native Linux only;
+    # WSL2 needs the device attached via usbipd first - see README).
     # devices:
     #   - "/dev/video0:/dev/video0"
     restart: unless-stopped
