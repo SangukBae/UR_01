@@ -41,9 +41,15 @@ works unchanged regardless of which bridge is running):
   /vision/objects_json     std_msgs/String
                            YOLO detections as JSON: {"objects": [...],
                            "frame_width": W, "frame_height": H} -- boxes
-                           are in pixel xyxy at that resolution (2D only,
-                           no depth fusion -- see repo CLAUDE.md's "Known
-                           gaps"). Only published when YOLO is enabled.
+                           are in pixel xyxy at that resolution. Only
+                           published when YOLO is enabled.
+
+Every hand (in /vision/humans_json) and object (in /vision/objects_json)
+also carries a `distance_m` field -- real depth in meters from the
+RealSense's depth sensor at that hand/object's pixel, aligned to the color
+frame (see vision_human_track/src/realsense_camera.py's
+RealSenseCapture.get_distance). `null` if no valid depth was available
+there (out of the ~0.2-10m range, a reflective/dark surface, etc.).
 
 Coordinate frame: everything above is camera-relative (MediaPipe's
 normalized [0,1] image x/y + its own relative z for hands/skeleton, pixel
@@ -67,9 +73,11 @@ from visualization_msgs.msg import MarkerArray
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_REPO_ROOT / "vision_human_track"))
 sys.path.insert(0, str(_REPO_ROOT / "vision_human_track" / "src"))
 
 from detector import HumanHandTracker  # noqa: E402
+from live_demo import add_distances  # noqa: E402
 from realsense_camera import RealSenseCapture, list_realsense_devices  # noqa: E402
 from vision_bridge_node import build_hands_msg, build_markers_msg  # noqa: E402
 
@@ -135,21 +143,26 @@ class RealsenseVisionNode(Node):
             self.get_logger().warning("Failed to read a frame from the RealSense.")
             return
 
+        height, width = bgr.shape[:2]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self._tracker.detect(mp_image)
+
+        detections = None
+        if self._yolo_model is not None:
+            yolo_result = self._yolo_model.predict(
+                source=bgr, conf=0.25, device="cpu", verbose=False
+            )[0]
+            detections = self._serialize_detections(yolo_result)
+
+        add_distances(result, detections, self._cap, width, height)
 
         stamp = self.get_clock().now().to_msg()
         self._hands_pub.publish(build_hands_msg(result, stamp, self._frame_id))
         self._markers_pub.publish(build_markers_msg(result, stamp, self._frame_id))
         self._json_pub.publish(String(data=json.dumps(result)))
 
-        if self._yolo_model is not None:
-            yolo_result = self._yolo_model.predict(
-                source=bgr, conf=0.25, device="cpu", verbose=False
-            )[0]
-            detections = self._serialize_detections(yolo_result)
-            height, width = bgr.shape[:2]
+        if detections is not None:
             self._objects_pub.publish(String(data=json.dumps({
                 "objects": detections, "frame_width": width, "frame_height": height,
             })))

@@ -93,14 +93,26 @@ same DDS-discovery flakiness noted below — `ros2 topic list`/`echo` hung
 until `ros2 daemon stop && ros2 daemon start`, unrelated to this node's
 own code.
 
+**`distance_m` (real depth, added 2026-08-20): logic-verified only, not
+yet against the real sensor.** The RealSense was physically disconnected
+from this sandbox (`usbipd list` stopped showing the device — a hardware/
+cable issue, not caused by this change) at the time this was built, so the
+median-ROI depth lookup (`vision_human_track/src/realsense_camera.py`'s
+`RealSenseCapture.get_distance`) and the pixel-coordinate math
+(`add_distances` in `live_demo.py`, imported and reused here) were only
+verified with synthetic depth data — outlier rejection, out-of-bounds,
+no-data-yet all covered, see `vision_human_track/README.md`'s known gaps.
+Re-verify `distance_m` against a real object at a known distance once the
+camera is reattached.
+
 ## Topics published
 
 | Topic | Type | Contents | Published by |
 |---|---|---|---|
 | `/vision/hands` | `geometry_msgs/PoseArray` | One `Pose` per detected hand: `position` = palm center, `orientation` = a quaternion whose local +Z axis points along the palm normal (see `geometry.py`'s `quat_from_z_axis` docstring — this fixes 2 of 3 rotational DOF, not the hand's roll). | both |
 | `/vision/humans_markers` | `visualization_msgs/MarkerArray` | One `LINE_LIST` marker per detected person (simplified limb/torso skeleton) — viewable directly in RViz, zero custom-message parsing needed. | both |
-| `/vision/humans_json` | `std_msgs/String` | The vision service's raw JSON response, one message per poll/frame — full 33-point skeleton, all 21 hand landmarks per hand, IDs, unassigned hands. Everything the two typed topics above don't carry, without needing a custom `.msg` package. | both |
-| `/vision/objects_json` | `std_msgs/String` | `{"objects": [...], "frame_width": W, "frame_height": H}` — one YOLO detection per object (`class_name`, `instance_name`, `confidence`, pixel `xyxy` box at that frame's resolution). 2D only, no depth fusion. | `realsense_vision_node.py` only |
+| `/vision/humans_json` | `std_msgs/String` | The vision service's raw JSON response, one message per poll/frame — full 33-point skeleton, all 21 hand landmarks per hand, IDs, unassigned hands. Everything the two typed topics above don't carry, without needing a custom `.msg` package. On `realsense_vision_node.py`, each hand also carries a real `distance_m` (metres, from the aligned depth sensor; `null` if no valid depth at that pixel). | both |
+| `/vision/objects_json` | `std_msgs/String` | `{"objects": [...], "frame_width": W, "frame_height": H}` — one YOLO detection per object (`class_name`, `instance_name`, `confidence`, pixel `xyxy` box, and a real `distance_m` at the box center — same depth source/caveats as `/vision/hands`' `distance_m`). `realsense_vision_node.py` only. | `realsense_vision_node.py` only |
 
 **Coordinate frame**: everything is in the vision service's own output
 frame — camera-relative, normalized `[0,1]` image x/y for hands/skeleton

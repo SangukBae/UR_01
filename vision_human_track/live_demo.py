@@ -20,6 +20,13 @@ draws skeleton/palm-center/orientation overlay, shows it in a window.
                                        # YOLO26 model (needs `pip install
                                        # ultralytics` in this venv)
 
+With --realsense, every hand and (if --yolo) object also gets a real
+`distance_m` (meters, from the RealSense depth sensor, aligned to the
+color frame -- see realsense_camera.py's RealSenseCapture.get_distance)
+printed to the console and drawn on the video. None if depth data wasn't
+available at that pixel (out of the sensor's range, a reflective/dark
+surface, etc.) -- not shown on plain-webcam runs, which have no depth.
+
 Press 'q' in the window to quit.
 
 --ros2 builds and publishes the same topics as
@@ -53,10 +60,69 @@ from test_real_image import draw_result  # noqa: E402
 POINTS_TO_PRINT = [0, 1, 4, 5, 8, 17, 20]
 
 
+def _hand_pixel(hand, width, height):
+    """Palm center's normalized (x, y) -> color-frame pixel coords, for a
+    RealSense depth lookup (get_distance needs pixel indices, not [0,1])."""
+    px, py, _ = hand["palm_center"]
+    return int(px * width), int(py * height)
+
+
+def add_distances(result, yolo_detections, cap, width, height):
+    """Fills in a `distance_m` field (float or None) on every hand and
+    object, using `cap.get_distance` -- only present when `cap` is a
+    RealSenseCapture (plain cv2.VideoCapture has no depth). Mutates the
+    dicts in place, same convention as the rest of this module's data
+    flow (e.g. HumanHandTracker.detect's own result dict)."""
+    if not hasattr(cap, "get_distance"):
+        return
+    all_hands = list(result["unassigned_hands"])
+    for human in result["humans"]:
+        all_hands.extend(human["hands"])
+    for hand in all_hands:
+        x, y = _hand_pixel(hand, width, height)
+        hand["distance_m"] = cap.get_distance(x, y)
+
+    if yolo_detections:
+        for det in yolo_detections:
+            x1, y1, x2, y2 = det["xyxy"]
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            det["distance_m"] = cap.get_distance(cx, cy)
+
+
+def draw_distances(image, result, yolo_detections, width, height):
+    """Separate overlay pass, after draw_result()/yolo_plot() have already
+    drawn the skeleton/box overlays -- keeps this module's own distance
+    text independent of test_real_image.py's draw_result and the
+    teammate's yolo_plot, rather than reaching into either."""
+    all_hands = list(result["unassigned_hands"])
+    for human in result["humans"]:
+        all_hands.extend(human["hands"])
+    for hand in all_hands:
+        distance = hand.get("distance_m")
+        if distance is None:
+            continue
+        x, y = _hand_pixel(hand, width, height)
+        cv2.putText(image, f"{distance:.2f}m", (x + 8, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    if yolo_detections:
+        for det in yolo_detections:
+            distance = det.get("distance_m")
+            if distance is None:
+                continue
+            x1, _, _, y2 = (int(v) for v in det["xyxy"])
+            cv2.putText(image, f"{distance:.2f}m", (x1, int(y2) + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    return image
+
+
 def _print_hand(hand, prefix="    "):
+    distance = hand.get("distance_m")
+    distance_str = f"{distance:.2f}m" if distance is not None else "n/a"
     print(f"{prefix}hand={hand['handedness']} "
           f"palm_center={[round(v, 3) for v in hand['palm_center']]} "
-          f"normal={[round(v, 3) for v in hand['normal']]}")
+          f"normal={[round(v, 3) for v in hand['normal']]} "
+          f"distance={distance_str}")
     for idx in POINTS_TO_PRINT:
         lm = hand["landmarks"][idx]
         print(f"{prefix}  point {idx}: "
@@ -78,8 +144,11 @@ def print_coords(result, yolo_detections=None):
         if not yolo_detections:
             print("  (no objects detected)")
         for det in yolo_detections:
+            distance = det.get("distance_m")
+            distance_str = f"{distance:.2f}m" if distance is not None else "n/a"
             print(f"  object {det['instance_name']} "
-                  f"confidence={det['confidence']} xyxy={det['xyxy']}")
+                  f"confidence={det['confidence']} xyxy={det['xyxy']} "
+                  f"distance={distance_str}")
 
 
 def main():
@@ -201,9 +270,20 @@ def main():
                 print("Failed to read a frame - camera may have disconnected.")
                 break
 
+            height, width = bgr.shape[:2]
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = tracker.detect(mp_image)
+
+            yolo_detections = None
+            if yolo_model is not None:
+                yolo_result = yolo_model.predict(
+                    source=bgr, conf=0.25, device=yolo_device, verbose=False
+                )[0]
+                yolo_detections = yolo_serialize(yolo_result)
+
+            if args.realsense:
+                add_distances(result, yolo_detections, cap, width, height)
 
             if ros_node is not None:
                 stamp = ros_node.get_clock().now().to_msg()
@@ -213,14 +293,10 @@ def main():
                 rclpy.spin_once(ros_node, timeout_sec=0)
 
             annotated = draw_result(bgr, result)
-
-            yolo_detections = None
-            if yolo_model is not None:
-                yolo_result = yolo_model.predict(
-                    source=bgr, conf=0.25, device=yolo_device, verbose=False
-                )[0]
-                yolo_detections = yolo_serialize(yolo_result)
+            if yolo_detections is not None:
                 annotated = yolo_plot(yolo_result, yolo_detections, image=annotated)
+            if args.realsense:
+                annotated = draw_distances(annotated, result, yolo_detections, width, height)
 
             frame_count += 1
             elapsed = time.time() - fps_t0

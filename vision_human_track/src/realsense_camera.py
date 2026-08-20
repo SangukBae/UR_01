@@ -2,10 +2,12 @@
 camera (D435 etc.), so live_demo.py/api.py can swap it in without touching
 the rest of the read/warm-up/annotate loop.
 
-Only the color stream is used -- MediaPipe/YOLO both just want an RGB/BGR
-frame, same as any UVC webcam. Depth is available on `.last_depth_frame`
-for future use (e.g. camera-frame Z for palm centers / object distance)
-but nothing in this repo consumes it yet.
+Depth is aligned to the color frame on every read() (`rs.align` -- the
+color and depth sensors sit a few cm apart with different fields of view,
+so a raw depth frame's (x, y) doesn't line up with the same (x, y) in the
+color frame without this) and exposed via `.last_depth_frame` /
+`get_distance(x, y)`, so a color-frame pixel from a YOLO box or a
+MediaPipe landmark can be looked up directly for real-world distance.
 """
 import numpy as np
 import pyrealsense2 as rs
@@ -22,6 +24,7 @@ class RealSenseCapture:
         config = rs.config()
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        self._align = rs.align(rs.stream.color)
         try:
             self._profile = self._pipeline.start(config)
             self._opened = True
@@ -47,12 +50,48 @@ class RealSenseCapture:
             frames = self._pipeline.wait_for_frames(timeout_ms=5000)
         except RuntimeError:
             return False, None
+        frames = self._align.process(frames)
         color_frame = frames.get_color_frame()
         if not color_frame:
             return False, None
         self.last_depth_frame = frames.get_depth_frame()
         bgr = np.asanyarray(color_frame.get_data())
         return True, bgr
+
+    def get_distance(self, x: int, y: int, radius: int = 3) -> float | None:
+        """Real-world distance in meters at color-frame pixel (x, y) --
+        median over a (2*radius+1)^2 ROI, not a single-pixel read, since
+        individual depth pixels are commonly 0 ("no valid depth": object
+        edges, reflective/dark surfaces, out of the sensor's ~0.2-10m
+        range). Returns None if there's no depth frame yet, (x, y) is out
+        of bounds, or every sample in the ROI is invalid.
+
+        Needs `.last_depth_frame` from a prior read() -- and that frame is
+        already aligned to the color frame, so `x, y` here are the same
+        pixel coordinates as in the color image (a YOLO box center, a
+        MediaPipe landmark scaled to pixels), not raw depth-sensor pixels.
+        """
+        depth_frame = self.last_depth_frame
+        if depth_frame is None:
+            return None
+        width, height = depth_frame.get_width(), depth_frame.get_height()
+        if not (0 <= x < width and 0 <= y < height):
+            return None
+        samples = []
+        for dy in range(-radius, radius + 1):
+            py = y + dy
+            if not (0 <= py < height):
+                continue
+            for dx in range(-radius, radius + 1):
+                px = x + dx
+                if 0 <= px < width:
+                    d = depth_frame.get_distance(px, py)
+                    if d > 0:
+                        samples.append(d)
+        if not samples:
+            return None
+        samples.sort()
+        return samples[len(samples) // 2]
 
     def release(self):
         if self._opened:

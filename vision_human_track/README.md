@@ -121,6 +121,13 @@ normalized [0,1] image coordinates + relative depth** (this is the
   real hand of known orientation).
 - **`id`** (per human): a tracking ID across frames/calls, not a
   coordinate — see Known gaps for its stability caveats.
+- **`distance_m`** (hands only, `live_demo.py --realsense` and
+  `../ros2_vision_bridge/realsense_vision_node.py` only): real depth in
+  metres at the palm center's pixel, from the RealSense's depth sensor —
+  the one field here that ISN'T normalized/relative, a genuine metric
+  measurement. `None`/`null` if no valid depth was available there (out of
+  the sensor's ~0.2-10m range, a reflective/dark surface, etc.). Not
+  present at all on plain-webcam runs — there's no depth sensor to read.
 
 **`detect_photo.py --yolo`'s `"objects"` array — raw pixel coordinates,
 a different frame entirely:**
@@ -134,7 +141,9 @@ a different frame entirely:**
   teammate's separate YOLO module for one still image) — it is NOT part
   of `/detect/image` or `/detect/live`'s response; the actual REST API
   never returns object detections (see "Object detection is intentionally
-  not here" in Known gaps).
+  not here" in Known gaps). `live_demo.py --realsense --yolo` and
+  `realsense_vision_node.py` also add a `distance_m` field to each object
+  (bounding-box-center pixel), same meaning as the hands' field above.
 
 ## WSL2: attach a USB webcam first
 
@@ -240,12 +249,26 @@ normal-vector arrows pointing in a geometrically plausible direction.
   case applies here — RealSense streams through its own librealsense
   pipeline, not cv2's V4L2 backend. Verified end-to-end: real color frames
   in, correct hand detection out (`live_demo.py --realsense --yolo`, and
-  headless via `../ros2_vision_bridge/realsense_vision_node.py`). Depth
-  stream is also opened (`RealSenseCapture.last_depth_frame`) but nothing
-  in this repo consumes it yet. Known cosmetic issue: the camera is
-  mounted vertically on the robot arm, so frames come out ~90° rotated
-  from upright — not corrected in code, see `ros2_vision_bridge/
-  README.md`'s known gaps.
+  headless via `../ros2_vision_bridge/realsense_vision_node.py`). Known
+  cosmetic issue: the camera is mounted vertically on the robot arm, so
+  frames come out ~90° rotated from upright — not corrected in code, see
+  `ros2_vision_bridge/README.md`'s known gaps.
+- **Real depth (`distance_m`), added 2026-08-20.** `RealSenseCapture.
+  get_distance(x, y)` aligns the depth stream to the color stream
+  (`rs.align` — the two sensors are physically offset, so a raw depth
+  frame's pixel (x,y) isn't the same point as the color frame's (x,y)
+  without this) and reads a median over a small pixel neighborhood rather
+  than one raw sample, since individual depth pixels are commonly 0 ("no
+  valid depth") at edges/reflective surfaces. `live_demo.py --realsense`
+  and `realsense_vision_node.py` both call this for every detected hand's
+  palm center and (with `--yolo`/YOLO enabled) every object's box center,
+  adding a real `distance_m` (metres) field — see "Output coordinates in
+  detail" above. **Logic verified with synthetic depth data (median/outlier
+  rejection, out-of-bounds, no-data-yet all covered) — not yet verified
+  against the real sensor**, since the RealSense was physically
+  disconnected from this sandbox (`usbipd list` stopped showing it,
+  unrelated to this change) when this was built; re-verify with a real
+  object at a known distance once it's reattached.
 - **Hand-orientation sign convention (Left vs Right flip in
   `_palm_center_and_normal`) is still a geometric assumption, not
   confirmed against a real hand with known orientation.** The live demo
