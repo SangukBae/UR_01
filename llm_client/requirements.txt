@@ -9,3 +9,12 @@ fastmcp>=2.0
 # espeak-ng system-side for spoken replies (`paplay`, via tts.py).
 numpy>=1.24
 faster-whisper>=1.0
+
+# --voice --wake-word only: continuous background wake-word detection
+# (pretrained ONNX models, no training/API key needed -- see wakeword.py).
+# Needs scipy>=1.15 alongside numpy>=2 (openwakeword pulls in scikit-learn,
+# which pulls in scipy -- an older scipy built against numpy<1.25 raises
+# "numpy.core.multiarray failed to import" the moment openwakeword is
+# imported; upgrading scipy fixed it here, no numpy downgrade needed).
+openwakeword>=0.6
+scipy>=1.15

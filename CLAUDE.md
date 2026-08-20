@@ -24,17 +24,19 @@ server (translates intent into robot commands, tracks queue/state) → ROS
 watches people/objects in the scene for both safety and non-destructive
 "is this actually what I think it is" checks before acting.
 
-This repo covers: the MCP server + both robot backends (this user's Case
-1 assignment, done), the vision stack's human/hand half (this user's team
+This repo covers: the MCP server + both robot backends (this user's Case 1
+assignment, done), the vision stack's human/hand half (this user's team
 assignment, done), a ROS2 bridge + safety-stop demo tying vision to the
-robot (built past-assignment, to close the loop end to end), MoveIt-backed
-path checking + obstacle avoidance (added 2026-08-20, see below), and an
-LLM chat client. It does NOT cover: a real Digital Twin (3D visualization/
-mirrored simulation state — path checking and obstacle avoidance now exist,
-but there's no 3D scene view), object detection (a different teammate's
-module), or real spatial safety fencing (needs camera↔robot calibration,
-not built) — see "Known gaps" and the block-diagram cross-check below for
-the full picture of what's covered vs. not.
+robot (built past-assignment, to close the loop end to end), an LLM chat
+client with per-turn latency instrumentation and opt-in wake-word
+listening (both added 2026-08-20), and MoveIt-backed path checking +
+obstacle avoidance (also added 2026-08-20, see below). It does NOT cover:
+a real Digital Twin (3D visualization/mirrored simulation state — path
+checking and obstacle avoidance now exist, but there's no 3D scene view),
+object detection (a different teammate's module), or real spatial safety
+fencing (needs camera↔robot calibration, not built) — see "Known gaps" and
+the block-diagram cross-check below for the full picture of what's covered
+vs. not.
 
 ## Status
 
@@ -46,12 +48,15 @@ official spec: a `stop_robot` tool, a non-blocking command queue
 (`save_waypoint`/`list_waypoints`/`delete_waypoint`/
 `move_robot_to_waypoint`/`free_drive`, socket backend only) — both per the
 team's own architecture-meeting design — a standalone LLM chat client with
-voice I/O, a ROS2 driver integration, a standalone Vision Stack service
-(human detection + hand tracking), a ROS2 bridge republishing it as
-topics, a safety-stop demo closing the loop (vision → ROS2 → robot
-stop), and MoveIt-backed path checking + obstacle avoidance
-(`check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles`,
-`motion_planner.py`) — all verified live, not just written.
+voice I/O, per-turn latency reporting (`latency.py`), and opt-in wake-word
+listening (`wakeword.py`, `--wake-word`), a ROS2 driver integration, a
+standalone Vision Stack service (human detection + hand tracking), a ROS2
+bridge republishing it as topics, a safety-stop demo closing the loop
+(vision → ROS2 → robot stop), and MoveIt-backed path checking + obstacle
+avoidance (`check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles`,
+`motion_planner.py`) — all verified live, not just written (wake-word is
+the one exception: verified live against real mic audio with no crash, but
+not against an actual spoken wake word — see its Known gaps entry).
 
 Repo layout:
 - `case1/` — the MCP server (`server.py`), socket backend (`ur_client.py`),
@@ -281,6 +286,16 @@ local Whisper) and adds spoken replies via `tts.py` (`espeak-ng` →
   no reply to any command. Powering the robot on / releasing brakes only
   works through the browser UI (`http://localhost`), same as `README.md`
   already said — there's no way to script it from this sandbox.
+- **`openwakeword` (via scikit-learn -> scipy) crashes on import against
+  this sandbox's numpy 2.2.6** — `pip install openwakeword` pulls numpy>=2
+  as a transitive dependency, but the OS's pre-installed
+  `/usr/lib/python3/dist-packages/scipy` (1.8.0) was compiled against
+  numpy<1.25, so the moment anything imports it: `AttributeError: _ARRAY_
+  API not found` -> `ImportError: numpy.core.multiarray failed to import`.
+  Fixed with `pip install --upgrade scipy` (installs 1.15+ to
+  `/usr/local`, which shadows the broken OS one on `sys.path`) — no numpy
+  downgrade needed, and nothing else in this repo (faster-whisper included)
+  broke from the scipy upgrade.
 - **An un-shut-down `rclpy` node/executor can abort the interpreter on exit
   even after the actual test has already passed** — reproduced live:
   `test_server.py` printed `ALL PASSED`, then crashed with `terminate
@@ -430,9 +445,17 @@ simulator alone first.
   `chat.py` restructure — true "listen while moving" (interrupting a
   *voice* command mid-utterance, not just mid-tool-call-sequence) still
   needs running tool execution and input concurrently, not attempted.
-- **No true wake-word / continuous background listening** — `voice.py`
-  is armed per `listen()` call (each chat turn), not continuously. A real
-  wake-word engine (Porcupine, openWakeWord) would be its own dependency.
+- **Wake-word now exists (2026-08-20), opt-in.** `chat.py --voice
+  --wake-word` waits silently in the background for a wake word
+  (`wakeword.py`, pretrained openwakeword ONNX models) before arming a
+  command capture, instead of listening for a command immediately every
+  turn. Default word is openwakeword's bundled "hey jarvis" -- the team's
+  earlier candidate ("Ravel") isn't one of the bundled words and would need
+  training a custom model from scratch (a separate, later effort). Verified
+  live against the real mic for a sustained wait with no crash; NOT verified
+  against an actual spoken wake word in this sandbox (no way to speak into
+  the mic here) -- the detection logic itself is exercised, the actual
+  trigger-on-real-speech behavior isn't.
 - **Filler-word filtering is narrow by design** — only drops an utterance
   that's *exactly* one bare interjection ("um", "uh", ...); doesn't
   filter rambling non-command sentences (the LLM itself decides those
@@ -444,13 +467,25 @@ simulator alone first.
   (`gripper_closed` in `get_robot_state`, sourced from
   `actual_digital_output_bits` / ROS2 `io_states` — not an echo of what
   was commanded).
-- **Latency is unmeasured/unoptimized** — Cerebras itself is fast, but no
-  work has gone into streaming responses, parallel tool calls, or
-  measuring actual round-trip time. Same issue inside
-  `vision_human_track/src/detector.py`: pose and hand inference run
-  sequentially (two independent MediaPipe models on the same frame) —
-  running them in parallel would roughly halve this service's per-frame
-  contribution to the team's <1500ms voice-to-robot budget. Not done.
+- **Latency is now measured (2026-08-20), still unoptimized.** `chat.py`
+  prints a per-turn breakdown after every reply (`latency.py`'s
+  `TurnTimer`): each LLM call, each MCP tool call, and a total against the
+  team's 1500ms budget; `--voice` additionally prints the STT split
+  (record + transcribe time, with silent wait-for-speech time excluded
+  from the budget — a human deciding when to talk isn't part of it). One
+  real number from this session, MCP-call-only (no CEREBRAS_API_KEY
+  available in this sandbox to run the full LLM loop live):
+  `get_robot_state` ~20ms, `check_path` (MoveIt planning) ~373ms over an
+  actual round trip against the live simulator + move_group — notably
+  slower than a plain state read, worth watching if `check_path` ever
+  goes in the hot path of a voice command. No actual full voice-to-robot
+  number has been captured yet (needs a real API key + microphone run,
+  neither available in this sandbox session) — the instrumentation is
+  verified, the team's real end-to-end number is still unknown. Streaming
+  responses and parallel tool calls are still not implemented. Vision
+  pipeline parallelization (`vision_human_track/src/detector.py` running
+  pose and hand inference sequentially) is a separate, still-open latency
+  item — out of scope for this round (vision work deliberately excluded).
 - **`detector.py`'s hand-to-pose wrist matching doesn't check MediaPipe's
   `.visibility` on the wrist landmark** — unlike the skeleton-drawing code
   in `tests/test_real_image.py`, which skips landmarks below 0.3. An

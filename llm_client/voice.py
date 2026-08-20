@@ -57,6 +57,14 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
 
 _model = None
 
+# Filled in by listen() every call -- read this right after listen() returns
+# for a wait/record/transcribe breakdown of where the time went. wait_s
+# (silent, waiting for you to start talking) is NOT part of the team's
+# voice-to-robot latency budget (see ../CLAUDE.md); record_s + transcribe_s
+# are the real STT contribution to it, reported alongside chat.py's own
+# latency.py turn timing.
+LAST_TIMING: dict[str, float | None] = {"wait_s": None, "record_s": None, "transcribe_s": None}
+
 
 def _mic_chunks() -> Iterator[bytes]:
     """Yield raw s16le mono 16kHz chunks from the default PulseAudio source."""
@@ -77,7 +85,7 @@ def _mic_chunks() -> Iterator[bytes]:
 
 def _collect_utterance(
     chunks: Iterator[bytes], now_fn=time.monotonic,
-) -> bytes | None:
+) -> tuple[bytes | None, float | None]:
     """State machine: wait for speech to start, record until it stops (or a
     time cap hits). Pulled out of _mic_chunks so it's testable against a
     synthetic chunk sequence, without a real microphone -- ``now_fn`` is
@@ -88,8 +96,11 @@ def _collect_utterance(
     A fake clock advanced by CHUNK_MS per chunk exercises the timers
     deterministically instead.
 
-    Returns the recorded audio (concatenated raw s16le bytes), or None if
-    nothing loud enough started within MAX_WAIT_S.
+    Returns ``(audio, speech_started_at)`` -- ``audio`` is the recorded
+    audio (concatenated raw s16le bytes), or None if nothing loud enough
+    started within MAX_WAIT_S; ``speech_started_at`` is the ``now_fn()``
+    timestamp speech was first detected (None alongside a None audio),
+    for listen()'s wait-vs-record latency split.
     """
     collected: list[bytes] = []
     # A word's onset ramps up gradually, so waiting for RMS to cross
@@ -101,6 +112,7 @@ def _collect_utterance(
     preroll: list[bytes] = []
     preroll_chunks = int(PREROLL_S * 1000 / CHUNK_MS)
     speaking = False
+    speech_started_at: float | None = None
     silence_start: float | None = None
     t_start = now_fn()
 
@@ -114,6 +126,7 @@ def _collect_utterance(
         if not speaking:
             if rms >= START_RMS:
                 speaking = True
+                speech_started_at = now
                 collected.extend(preroll)
                 collected.append(data)
             else:
@@ -121,7 +134,7 @@ def _collect_utterance(
                 if len(preroll) > preroll_chunks:
                     preroll.pop(0)
                 if now - t_start >= MAX_WAIT_S:
-                    return None
+                    return None, None
             continue
 
         collected.append(data)
@@ -136,7 +149,7 @@ def _collect_utterance(
         if now - t_start >= MAX_UTTERANCE_S:
             break
 
-    return b"".join(collected) if collected else None
+    return (b"".join(collected) if collected else None), speech_started_at
 
 
 def _get_model():
@@ -176,14 +189,26 @@ def listen(prompt: str = "Listening... speak now.") -> str | None:
     Prints ``prompt``, then waits for you to start talking and records
     until you stop. Returns None if nothing was heard within MAX_WAIT_S,
     nothing intelligible was transcribed, or the whole utterance was a bare
-    filler word ("um", "uh", ...) -- see ``_is_filler``."""
+    filler word ("um", "uh", ...) -- see ``_is_filler``.
+
+    Sets LAST_TIMING (wait_s/record_s/transcribe_s) before returning, even
+    on a None return, so a caller doing latency accounting always has
+    something to read -- wait_s stays None only when speech never started
+    at all (nothing to charge record/transcribe time against either)."""
     print(prompt)
-    audio = _collect_utterance(_mic_chunks())
+    t_listen_start = time.monotonic()
+    audio, speech_started_at = _collect_utterance(_mic_chunks())
+    t_after_record = time.monotonic()
     if DEBUG:
         print()
     if audio is None:
+        LAST_TIMING.update(wait_s=None, record_s=None, transcribe_s=None)
         return None
+    LAST_TIMING["wait_s"] = speech_started_at - t_listen_start
+    LAST_TIMING["record_s"] = t_after_record - speech_started_at
+    t_transcribe_start = time.monotonic()
     text = transcribe(audio)
+    LAST_TIMING["transcribe_s"] = time.monotonic() - t_transcribe_start
     if text is not None and _is_filler(text):
         return None
     return text

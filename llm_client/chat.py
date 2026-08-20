@@ -39,6 +39,8 @@ from typing import Callable
 from fastmcp import Client
 from openai import OpenAI
 
+from latency import TurnTimer
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "case1"))
 from server import mcp, robot  # noqa: E402
 
@@ -85,6 +87,7 @@ async def main(
     hint: str,
     system_prompt: str = SYSTEM_PROMPT,
     speak: Callable[[str], None] | None = None,
+    get_stt_timing: Callable[[], dict] | None = None,
 ) -> None:
     """``get_input`` returns the next user message (or None/empty to skip a
     turn, e.g. voice mode hearing nothing) -- ``input("You: ")`` for typed
@@ -93,6 +96,11 @@ async def main(
     ``hint`` is just the startup line telling you which one is active.
     ``speak``, if given, is called with the final reply text each turn
     (``--voice`` passes ``tts.speak``; text mode leaves it None).
+    ``get_stt_timing``, if given, is called after each turn's reply to fetch
+    that turn's speech-capture/STT breakdown (``--voice`` passes a reader of
+    ``voice.LAST_TIMING``; text mode leaves it None -- there's no STT stage
+    to report) -- printed alongside this turn's own latency.py timing so the
+    full voice-to-robot budget is visible, not just the LLM/tool half.
     """
     api_key = os.environ.get(API_KEY_ENV)
     if not api_key:
@@ -132,6 +140,7 @@ async def main(
         print(f"{hint} Ctrl-C to quit.\n")
 
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        timer = TurnTimer()
         while True:
             try:
                 user_text = get_input()
@@ -145,16 +154,24 @@ async def main(
                 continue
             messages.append({"role": "user", "content": user_text})
 
+            # Turn officially starts here, not at get_input() -- a human
+            # deciding when to talk isn't part of the team's <1500ms
+            # voice-to-robot budget (see ../CLAUDE.md); get_stt_timing below
+            # reports the speech-capture/STT time separately instead of
+            # folding it into this total.
+            timer.start_turn()
+
             # Tool-call loop: keep feeding results back until the model
             # replies with plain text instead of another tool call. Capped --
             # reproduced live: asked for a specific tool by description
             # rather than name, the model called a different tool 31 times
             # in a row (same args each time) instead of ever stopping or
             # switching, with no error to break the loop on its own.
-            for _ in range(MAX_TOOL_ROUNDS):
-                response = llm.chat.completions.create(
-                    model=MODEL, messages=messages, tools=tools,
-                )
+            for round_num in range(MAX_TOOL_ROUNDS):
+                with timer.measure(f"llm_call_{round_num}"):
+                    response = llm.chat.completions.create(
+                        model=MODEL, messages=messages, tools=tools,
+                    )
                 message = response.choices[0].message
                 messages.append(message.model_dump(exclude_none=True))
 
@@ -168,7 +185,8 @@ async def main(
                     args = json.loads(call.function.arguments or "{}")
                     print(f"  -> {call.function.name}({args})")
                     try:
-                        result = await mcp_client.call_tool(call.function.name, args)
+                        with timer.measure(f"tool:{call.function.name}"):
+                            result = await mcp_client.call_tool(call.function.name, args)
                         content = json.dumps(result.data)
                     except Exception as exc:  # noqa: BLE001 -- surfaced to the LLM, not swallowed
                         content = json.dumps({"error": str(exc)})
@@ -182,14 +200,26 @@ async def main(
                 if speak is not None:
                     speak("There was an issue.")
 
+            if get_stt_timing is not None:
+                stt = get_stt_timing()
+                if stt.get("record_s") is not None:
+                    print(f"  [stt] record: {stt['record_s'] * 1000:.0f}ms, "
+                          f"transcribe: {stt['transcribe_s'] * 1000:.0f}ms  "
+                          f"(wait-for-speech {stt['wait_s'] * 1000:.0f}ms excluded from budget)")
+            print(timer.report())
+
 
 def _text_input() -> str | None:
     return input("You: ")
 
 
-def _voice_input() -> str | None:
+def _voice_input(require_wake_word: bool = False) -> str | None:
     import voice  # local import: numpy/faster-whisper are only needed here
 
+    if require_wake_word:
+        import wakeword  # local import: openwakeword only needed for this mode
+
+        wakeword.wait_for_wake_word()
     text = voice.listen("\U0001F3A4 Listening -- speak your command...")
     if text is None:
         print("(didn't catch anything, try again)")
@@ -204,12 +234,27 @@ if __name__ == "__main__":
         "--voice", action="store_true",
         help="Speak commands into the microphone instead of typing them (see voice.py).",
     )
+    parser.add_argument(
+        "--wake-word", action="store_true",
+        help="With --voice: wait for a wake word (default 'hey jarvis', see "
+             "wakeword.py) before each command capture, instead of listening "
+             "for a command immediately every turn.",
+    )
     args = parser.parse_args()
+    if args.wake_word and not args.voice:
+        raise SystemExit("--wake-word only applies with --voice.")
     if args.voice:
         import tts  # local import: only needed for --voice
+        import voice  # noqa: E402 -- also imported (cached) inside _voice_input
+        from functools import partial
+
         asyncio.run(main(
-            _voice_input, "Speaking mode -- each turn, just start talking.",
+            partial(_voice_input, require_wake_word=args.wake_word),
+            "Speaking mode -- each turn, just start talking."
+            if not args.wake_word else
+            "Speaking mode -- say the wake word, then your command.",
             system_prompt=VOICE_SYSTEM_PROMPT, speak=tts.speak,
+            get_stt_timing=lambda: voice.LAST_TIMING,
         ))
     else:
         asyncio.run(main(_text_input, "Type a message (e.g. 'move the robot home')."))

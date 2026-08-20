@@ -74,13 +74,46 @@ sudo apt install -y pulseaudio-utils espeak-ng   # parec (input) + espeak-ng (ou
 pactl list short sources                          # confirm a real default source
 ```
 
-No wake word -- armed on each `listen()` call, triggers on energy
-threshold. Env var tuning (see `voice.py`): `VOICE_START_RMS` (mic
+By default no wake word -- armed on each `listen()` call, triggers on
+energy threshold. Env var tuning (see `voice.py`): `VOICE_START_RMS` (mic
 sensitivity; `VOICE_DEBUG=1` to watch live RMS), `VOICE_SILENCE_HANG_S`
 (cuts off mid-sentence? raise it), `VOICE_MAX_WAIT_S`/`VOICE_MAX_UTTERANCE_S`
 (give-up caps), `WHISPER_MODEL` (`base.en` default; `small.en` more
 accurate). Stray noise can hallucinate a phrase (Whisper quirk) -- raise
 `VOICE_START_RMS` if that's frequent.
+
+### Wake word (optional)
+
+```bash
+python3 chat.py --voice --wake-word
+```
+
+Instead of listening for a command immediately every turn, waits silently
+in the background for a wake word first (`wakeword.py`, pretrained
+[openwakeword](https://github.com/dscripka/openWakeWord) ONNX models, no
+training or API key needed) -- default "hey jarvis" (openwakeword's own
+bundled word; swap in `alexa`/`hey_mycroft`/`hey_rhasspy`/`timer`/`weather`
+via `WAKE_WORD=...`, or tune sensitivity with `WAKE_THRESHOLD=...`, default
+`0.5`). The team's earlier candidate wake word ("Ravel") isn't one of
+openwakeword's bundled words -- would need training a custom model from
+scratch, a separate effort, out of scope here.
+
+```
+Speaking mode -- say the wake word, then your command. Ctrl-C to quit.
+
+👂 Waiting for wake word (hey jarvis)...
+🎤 Listening -- speak your command...
+You (heard): move the robot home
+  -> move_robot_to_position({})
+Robot: Done.
+```
+
+Shares `voice.py`'s exact mic transport (same `parec` process pattern, same
+PulseAudio source) -- no second concurrent mic open. Verified live against
+the real WSLg-bridged mic for a sustained wait with no crash; not verified
+against an actual spoken "hey jarvis" in this sandbox (no way to speak into
+the mic here) -- the pretrained model itself is openwakeword's own, not
+retrained or otherwise modified by this repo.
 
 **Known gap: not listening while a move is in progress.** Each turn blocks
 until its tool call returns, so saying "Stop" *while* the robot is mid-motion
@@ -88,6 +121,30 @@ doesn't reach it -- the mic isn't even recording at that moment (`stop_robot`
 exists and works, see `case1/server.py`, but only between turns or from a
 second concurrent client). Fixing this needs running tool execution and
 listening concurrently, not built here.
+
+## Latency
+
+Every turn prints a breakdown after the reply (`latency.py`'s `TurnTimer`):
+each LLM call, each MCP tool call, and a total against the team's <1500ms
+voice-to-robot budget (flagged over if it exceeds that). `--voice` adds a
+line above it for the speech-capture/STT split (record + transcribe time;
+silent wait-for-speech time is excluded from the budget -- deciding when to
+talk isn't part of it):
+
+```
+You: move the robot home
+  -> move_robot_to_position({})
+Robot: Done.
+  [stt] record: 1120ms, transcribe: 340ms  (wait-for-speech 890ms excluded from budget)
+  [latency]
+    llm_call_0: 610ms
+    tool:move_robot_to_position: 2150ms
+    TOTAL (LLM + tools, this turn): 2760ms  ** OVER the team's 1500ms budget **
+```
+
+Not optimized yet, just measured -- see `../CLAUDE.md`'s Known gaps for
+what a real number from this points at next (streaming, parallel tool
+calls, or a faster move for the actual robot-motion tools).
 
 ## Other endpoints
 
