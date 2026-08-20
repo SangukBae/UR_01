@@ -255,6 +255,32 @@ local Whisper) and adds spoken replies via `tts.py` (`espeak-ng` →
   a nonzero/odd exit code even when it *did* kill the process (and
   sometimes doesn't kill it at all) — always verify with `pgrep -af
   <pattern>` afterward rather than trusting pkill's own exit status.
+- **Root cause of the DDS-discovery flakiness found (2026-08-20): this
+  WSL2 sandbox's only non-loopback interface can't send UDP to itself.**
+  `ros2 topic list`/`echo` would hang indefinitely (not error, just never
+  return), with the log filling with `ddsi_udp_conn_write ... failed`
+  aimed at this host's own eth1 address and the DDS multicast group
+  (`239.255.0.1`) — a hairpin-NAT/virtual-switch limitation of this WSL2
+  network, not a code bug. Every SPDP discovery packet CycloneDDS sends
+  over that interface fails, so nodes can't find each other until a lucky
+  retry (the old `ros2 daemon stop && ros2 daemon start` workaround just
+  got lucky by forcing a fresh discovery round, not by fixing anything).
+  Real fix, scoped to work that doesn't need to interoperate with nodes
+  outside this shell's own loopback: `ros2_vision_bridge/
+  cyclonedds_localhost.xml` forces CycloneDDS onto `lo` only (multicast
+  disabled, unicast-peers to `localhost`) — `export CYCLONEDDS_URI="file://
+  $(pwd)/cyclonedds_localhost.xml"` (run from that directory) alongside
+  the usual `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`. Verified: 10
+  consecutive `ros2 topic echo --once` calls against a live publisher, all
+  instant, zero hangs. **Deliberately not set in `~/.bashrc`** — confirmed
+  live that a shell with this config can't see nodes started under the
+  default config on another interface (tested against this sandbox's
+  already-running `ur_robot_driver`/`ur_moveit_config` stack: `/joint_states`
+  invisible with the fix on, visible with it off). Fine for the vision
+  stack (`safety_stop_demo.py` talks to the robot over a socket, not the
+  ROS graph) but wrong for anything that needs to share a graph with
+  `move_group`/the UR driver — use the plain daemon-restart workaround for
+  those instead, or restart that whole graph fresh under the same config.
 - **Webcam frames over `usbipd-win`/WSL2 need MJPG forced, not the default
   raw format, plus a handful of discarded warm-up frames.** Found live: the
   first `cv2.VideoCapture` reads after attaching a real USB webcam this way

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <!-- This WSL2 sandbox's only non-loopback interface (eth1,
+           10.125.78.36) can't send UDP back to itself or to the DDS
+           multicast group (239.255.0.1) -- every discovery packet on it
+           fails with "ddsi_udp_conn_write ... failed", which breaks
+           discovery for `ros2 topic list`/`echo` until the daemon is
+           restarted. Every ROS2 node in this project runs on this same
+           host, so binding to loopback only and using unicast discovery
+           sidesteps the broken interface entirely instead of working
+           around its symptom after the fact. -->
+      <Interfaces>
+        <NetworkInterface name="lo" priority="default" multicast="false"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+        <Peer address="localhost"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

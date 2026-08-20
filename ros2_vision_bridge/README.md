@@ -46,6 +46,7 @@ drop-in until they have that.
 ```bash
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp   # see ros2_ur_driver/README.md - required in this sandbox
+export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"   # optional, fixes flaky discovery - see Known gaps (run from this directory)
 pip install requests                            # only non-ROS dependency
 python3 vision_bridge_node.py
 ```
@@ -65,6 +66,7 @@ python3 vision_bridge_node.py --ros-args -p vision_api_url:=http://192.168.1.50:
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 cd ../vision_human_track && source venv/bin/activate && cd ../ros2_vision_bridge
+export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"   # optional, fixes flaky discovery - see Known gaps
 pip install pyrealsense2   # once, if not already in that venv
 python3 realsense_vision_node.py               # person + hand + object
 python3 realsense_vision_node.py --no-yolo      # person + hand only, skips loading YOLO
@@ -138,6 +140,7 @@ specifically (see meeting notes).
 ```bash
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"   # optional, fixes flaky discovery - see Known gaps (run from this directory)
 python3 safety_stop_demo.py
 ```
 
@@ -174,17 +177,41 @@ this running to see the whole thing end-to-end with a real hand.
   the same class of issue showing up even single-person. Don't trust
   `/vision/humans_markers`'/`_json`'s `id` field to stay stable over more
   than a few seconds without re-checking this.
-- **DDS discovery is flaky in this sandbox.** `ros2 topic echo`/`ros2 node
-  list` intermittently saw nothing even with the node running and
-  `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` set and the daemon restarted —
-  a stale node process (left over from an earlier restart attempt) was
-  the actual cause once, but the log also fills with continuous
-  `ddsi_udp_conn_write ... failed` noise pointing at a stale peer address,
-  which looks like a broader multicast/networking quirk in this
-  environment (same category as the `ros2_ur_driver/README.md` FastRTPS
-  note, just showing up differently). If topics seem to vanish, kill and
-  restart the node fresh (`pgrep -af vision_bridge_node`, `kill -9`) before
-  assuming the code is wrong.
+- **DDS discovery is flaky in this sandbox — root cause found (2026-08-20),
+  fixable for vision-only work.** `ros2 topic list`/`echo` would hang
+  indefinitely (not just "see nothing" — the CLI process itself never
+  returned), with the log filling with `ddsi_udp_conn_write ... failed`
+  aimed at this host's own eth1 address (`10.125.78.36`) and the DDS
+  multicast group (`239.255.0.1`). Root cause: this WSL2 sandbox's only
+  non-loopback interface can't send UDP to itself or to that multicast
+  group (a hairpin-NAT/virtual-switch limitation, not a code bug) — every
+  SPDP discovery packet CycloneDDS sends over it fails, so nodes can't
+  find each other until a lucky retry (or a `ros2 daemon stop && ros2
+  daemon start`, which was the old workaround). Fix: force CycloneDDS onto
+  loopback only, where this failure mode doesn't exist — this directory's
+  `cyclonedds_localhost.xml` (binds to `lo`, disables multicast,
+  unicast-peers to `localhost`) plus, run from here:
+  ```bash
+  export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"
+  ```
+  alongside the usual `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`. Verified:
+  10 consecutive `ros2 topic echo --once` calls against a live publisher,
+  all instant, zero hangs (previously intermittent even right after a
+  daemon restart).
+
+  **Not set globally in `~/.bashrc` on purpose** — confirmed live that a
+  shell with this loopback-only config genuinely cannot see nodes started
+  under the *default* config on another interface (tested against this
+  sandbox's already-running `ur_robot_driver`/`ur_moveit_config` stack:
+  `/joint_states` was invisible with the fix on, visible with it off). The
+  vision stack doesn't need that interop — `safety_stop_demo.py` talks to
+  the robot directly over a socket, not through the ROS graph — so it's
+  safe to export this only in a shell doing vision-stack work
+  specifically. If a future node genuinely needs to be on the *same* ROS
+  graph as `ur_robot_driver`/`move_group`, don't use this fix for that
+  shell; fall back to the plain daemon-restart workaround instead (or
+  restart the whole graph fresh so everything picks up the loopback
+  config together).
 - **No obstacle-avoidance/safety-fencing consumer built yet** — this node
   only publishes; nothing currently subscribes to `/vision/hands` to
   actually stop or slow the robot. That's the ROS/digital-twin side's
