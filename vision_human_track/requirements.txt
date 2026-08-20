@@ -8,3 +8,8 @@ pydantic_core==2.46.4
 python-multipart==0.0.32
 starlette==1.6.0
 uvicorn==0.52.4
+
+# Only needed for live_demo.py --realsense (local GUI demo, not the Docker
+# API service -- an Intel RealSense needs direct USB/hardware access that
+# doesn't make sense to containerize here).
+pyrealsense2==2.58.3.10794

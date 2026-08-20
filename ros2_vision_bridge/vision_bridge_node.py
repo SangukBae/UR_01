@@ -45,7 +45,6 @@ import time
 from pathlib import Path
 
 import rclpy
-import requests
 from geometry_msgs.msg import Point, Pose, PoseArray
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -68,8 +67,63 @@ POSE_CONNECTIONS = [
 ]
 
 
+def build_hands_msg(data: dict, stamp, frame_id: str) -> PoseArray:
+    """Shared with live_demo.py's --ros2 mode, which builds this in-process
+    instead of polling the REST API."""
+    msg = PoseArray()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+
+    all_hands = list(data.get("unassigned_hands", []))
+    for human in data.get("humans", []):
+        all_hands.extend(human.get("hands", []))
+
+    for hand in all_hands:
+        pose = Pose()
+        px, py, pz = hand["palm_center"]
+        pose.position = Point(x=px, y=py, z=pz)
+        qx, qy, qz, qw = quat_from_z_axis(hand["normal"])
+        pose.orientation.x, pose.orientation.y = qx, qy
+        pose.orientation.z, pose.orientation.w = qz, qw
+        msg.poses.append(pose)
+
+    return msg
+
+
+def build_markers_msg(data: dict, stamp, frame_id: str) -> MarkerArray:
+    """Shared with live_demo.py's --ros2 mode, which builds this in-process
+    instead of polling the REST API."""
+    markers = MarkerArray()
+    for human in data.get("humans", []):
+        skeleton = human["skeleton"]
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = frame_id
+        marker.ns = "vision_humans"
+        marker.id = human["id"]
+        marker.type = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = 0.01
+        marker.color.g = 1.0
+        marker.color.a = 1.0
+        marker.lifetime.sec = 1  # auto-clear if this ID stops publishing
+
+        for a, b in POSE_CONNECTIONS:
+            if skeleton[a]["visibility"] < 0.3 or skeleton[b]["visibility"] < 0.3:
+                continue
+            marker.points.append(Point(x=skeleton[a]["x"], y=skeleton[a]["y"], z=skeleton[a]["z"]))
+            marker.points.append(Point(x=skeleton[b]["x"], y=skeleton[b]["y"], z=skeleton[b]["z"]))
+
+        markers.markers.append(marker)
+    return markers
+
+
 class VisionBridgeNode(Node):
     def __init__(self):
+        import requests  # only this class polls the REST API; keeps the
+                          # module importable (e.g. by live_demo.py --ros2,
+                          # which never calls this class) without requests.
+
         super().__init__("vision_bridge")
 
         self.declare_parameter("vision_api_url", "http://localhost:8000")
@@ -93,6 +147,8 @@ class VisionBridgeNode(Node):
         )
 
     def _poll(self):
+        import requests
+
         try:
             resp = self._session.post(f"{self._api_url}/detect/live", timeout=2.0)
             resp.raise_for_status()
@@ -114,49 +170,10 @@ class VisionBridgeNode(Node):
         self._publish_markers(data, stamp)
 
     def _publish_hands(self, data: dict, stamp) -> None:
-        msg = PoseArray()
-        msg.header.stamp = stamp
-        msg.header.frame_id = self._frame_id
-
-        all_hands = list(data.get("unassigned_hands", []))
-        for human in data.get("humans", []):
-            all_hands.extend(human.get("hands", []))
-
-        for hand in all_hands:
-            pose = Pose()
-            px, py, pz = hand["palm_center"]
-            pose.position = Point(x=px, y=py, z=pz)
-            qx, qy, qz, qw = quat_from_z_axis(hand["normal"])
-            pose.orientation.x, pose.orientation.y = qx, qy
-            pose.orientation.z, pose.orientation.w = qz, qw
-            msg.poses.append(pose)
-
-        self._hands_pub.publish(msg)
+        self._hands_pub.publish(build_hands_msg(data, stamp, self._frame_id))
 
     def _publish_markers(self, data: dict, stamp) -> None:
-        markers = MarkerArray()
-        for human in data.get("humans", []):
-            skeleton = human["skeleton"]
-            marker = Marker()
-            marker.header.stamp = stamp
-            marker.header.frame_id = self._frame_id
-            marker.ns = "vision_humans"
-            marker.id = human["id"]
-            marker.type = Marker.LINE_LIST
-            marker.action = Marker.ADD
-            marker.scale.x = 0.01
-            marker.color.g = 1.0
-            marker.color.a = 1.0
-            marker.lifetime.sec = 1  # auto-clear if this ID stops publishing
-
-            for a, b in POSE_CONNECTIONS:
-                if skeleton[a]["visibility"] < 0.3 or skeleton[b]["visibility"] < 0.3:
-                    continue
-                marker.points.append(Point(x=skeleton[a]["x"], y=skeleton[a]["y"], z=skeleton[a]["z"]))
-                marker.points.append(Point(x=skeleton[b]["x"], y=skeleton[b]["y"], z=skeleton[b]["z"]))
-
-            markers.markers.append(marker)
-        self._markers_pub.publish(markers)
+        self._markers_pub.publish(build_markers_msg(data, stamp, self._frame_id))
 
 
 def main():

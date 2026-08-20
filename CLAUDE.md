@@ -76,16 +76,31 @@ Repo layout:
   skeleton + per-person ID (MediaPipe PoseLandmarker) and full 21-point
   hand skeleton + derived palm-center/orientation (MediaPipe HandLandmarker).
   This user's team assignment; object detection is a separate teammate's
-  module, not built here. `live_demo.py` is a local-only live-webcam GUI
-  preview (not part of the API). Verified live against a real webcam
-  (WSL2 + usbipd-win passthrough) — see its README for the API contract
-  and known gaps (handedness sign convention still not empirically
-  verified, person-ID stability shakier than intended).
-- `ros2_vision_bridge/` — plain rclpy script (no colcon package, matches
-  `ros2_ur_driver/`'s convention) that polls `vision_human_track`'s
-  `/detect/live` and republishes it as ROS2 topics (`/vision/hands`,
-  `/vision/humans_markers`, `/vision/humans_json`). Verified live at 10Hz
-  against the real webcam + vision service. Also has `safety_stop_demo.py`
+  module (`../yolo/`), not built here, but `live_demo.py --yolo` can run it
+  alongside for a combined demo. `live_demo.py` is a local-only live-camera
+  GUI preview (not part of the API) — `--realsense` points it at an
+  attached Intel RealSense (`src/realsense_camera.py`, via pyrealsense2)
+  instead of a plain `cv2.VideoCapture` index. Verified live against both a
+  real webcam and a real RealSense D435 (both WSL2 + usbipd-win
+  passthrough, different busid/VID:PID per device) — see its README for
+  the API contract and known gaps (handedness sign convention still not
+  empirically verified, person-ID stability shakier than intended,
+  RealSense frames come out ~90° rotated since it's mounted vertically on
+  the robot arm).
+- `ros2_vision_bridge/` — two plain rclpy scripts (no colcon package,
+  matches `ros2_ur_driver/`'s convention), same output topics either way.
+  `vision_bridge_node.py` polls `vision_human_track`'s `/detect/live` and
+  republishes it as ROS2 topics (`/vision/hands`, `/vision/humans_markers`,
+  `/vision/humans_json`) — verified live at 10Hz against the real webcam +
+  vision service. `realsense_vision_node.py` instead owns an attached
+  RealSense directly (no REST service in between) and runs MediaPipe +
+  YOLO in-process, adding a fourth topic (`/vision/objects_json`) for
+  object detections — verified live against the real RealSense D435 at
+  ~5.8Hz (person+hand+object inference on CPU is heavier than person+hand
+  alone). Both share their message-building code
+  (`vision_bridge_node.py`'s `build_hands_msg`/`build_markers_msg`), so any
+  existing consumer works unchanged regardless of which one is running.
+  Also has `safety_stop_demo.py`
   — subscribes to `/vision/hands` and calls `stop_robot` on any hand
   presence, closing the vision→ROS2→robot-stop loop end to end (talks to
   the robot directly, not through the MCP layer — a safety reaction
@@ -113,7 +128,7 @@ commands, not a blanket override of normal safety judgment.
 
 ## Architecture
 
-`server.py` exposes 31 MCP tools over stdio (8 from the original four
+`server.py` exposes 32 MCP tools over stdio (8 from the original four
 tiers, the rest additive -- queue, waypoints, programs, relative moves,
 vision passthrough, tracking -- see the tool list below). Two interchangeable backends
 behind the same `RobotState` shape (`q_rad`, `qd_rad`, `tcp_pose`,
@@ -369,40 +384,68 @@ means the sim can act as a genuine safety pre-check. User agreed; built
 
 `ShadowClient` duck-types `URClient`'s surface (`connect`, `get_state`,
 `move_joint`, `move_linear`, `move_waypoints`, `set_gripper`, `free_drive`,
-`stop`) so none of `server.py`'s 31 tools needed to change — only the
-backend-selection block did (`UR_REAL_HOST` env var, socket backend only;
-raises clearly if combined with `UR_BACKEND=ros2`, not supported — one ROS2
-graph talks to one controller). Target-reaching moves run on sim first and
-block; only on success does the identical command go to the real robot — a
-sim failure (protective stop, timeout, joint limit) never reaches the real
-arm. `stop()` is the deliberate exception: sent to both independently, each
-in its own try/except, never gated on the other. `get_state()` (so
-`get_robot_state` and everything downstream, including
+`stop`) so none of `server.py`'s 31 pre-existing tools needed to change —
+only the backend-selection block did (`UR_REAL_HOST` env var, socket
+backend only; raises clearly if combined with `UR_BACKEND=ros2`, not
+supported — one ROS2 graph talks to one controller). Target-reaching moves
+run on sim first and block; only on success does the identical command go
+to the real robot — a sim failure (protective stop, timeout, joint limit)
+never reaches the real arm. `stop()` is the deliberate exception: sent to
+both independently, each in its own try/except, never gated on the other.
+`get_state()` (so `get_robot_state` and everything downstream, including
 `get_environment_shadow`'s cache) reports the *real* robot once one is
 configured — sim is a pre-flight gate, not what operators are told the
 robot is doing. `free_drive()` skips sim entirely (no target to verify
 against) and goes straight to whichever robot is meant to be hand-guided.
 
-Verified: full default `test_server.py` (31 tools, live simulator, no
-`UR_REAL_HOST`) still passes unchanged after the edit — confirms shadow
-mode is genuinely opt-in with zero behavior change when off. Also wrote
-`case1/test_shadow_client.py`, a network-free unit test against fake
-stand-in clients, covering: sim failure blocks real entirely; sim success
-replays onto real with identical args; real failure after sim success
-raises a clear combined error (not silently swallowed); `get_state()`
-prefers real; `stop()` attempts both independently even when one raises;
-`free_drive()` skips sim. All pass.
+**Pose sync (added 2026-08-20).** The pre-flight gate above only means
+anything if the simulator's current pose actually matches the real robot's
+— otherwise "verified safe in sim" describes a swept path (singularities,
+joint limits) the real robot, starting somewhere else entirely, would never
+actually take. This is a real gap, not hypothetical: the simulator boots at
+its own home pose regardless of wherever the physical arm happens to be
+(powered on mid-lesson, jogged by hand, left over from a previous session).
+Found live the first time a real UR10 was actually reachable from this
+sandbox (`192.168.1.100`, discovered via a port probe of the workspace LAN
+— has 29999/30001-30004 all open, unlike the simulator which has no
+dashboard-server on 29999, see Known gaps): the real robot's joints
+(~`[-78, -96, -65, -79, 58, 59]` deg) were nowhere near the sim's home pose
+(`[0, -90, 0, -90, 0, 0]` deg). Fixed with a one-directional sync — never
+the reverse, since moving the real robot to match an arbitrary sim pose is
+exactly the unverified motion shadow mode exists to prevent:
+`ShadowClient.connect()` now reads the real robot's actual joint angles and
+drives the SIMULATOR to match before anything is verified.
+`sync_sim_to_real()` (new `server.py` tool, same name) re-does this on
+demand; it also now runs automatically right after `free_drive()`, since
+hand-guiding moves only the real robot and would otherwise leave the sim
+stale from that point on.
 
-**Not verified against an actual physical robot** — none is reachable from
-this sandbox (no `UR_REAL_HOST` value exists to test with; confirmed via
-`docker ps`/`ss` that only the simulator container is running, on
-`127.0.0.1`, with no real robot IP configured anywhere in the repo). Only
-the gating logic itself has been exercised, not real network behavior
-against real UR hardware (real controller connect timing, real protective
-stops, real motion — all unverified). Before this is ever pointed at a
-physical arm: confirm the workspace is clear, someone has hands on/near the
-physical e-stop, and target poses have already been proven safe on the
-simulator alone first.
+Verified: full default `test_server.py` (32 tools, live simulator, no
+`UR_REAL_HOST`) still passes unchanged — confirms shadow mode is genuinely
+opt-in with zero behavior change when off. `case1/test_shadow_client.py`
+(network-free, fake stand-in clients) covers: sim failure blocks real
+entirely; sim success replays onto real with identical args; real failure
+after sim success raises a clear combined error (not silently swallowed);
+`get_state()` prefers real; `stop()` attempts both independently even when
+one raises; `free_drive()` skips sim for the move itself but triggers a
+sim resync right after; `connect()` syncs sim to real up front;
+`sync_sim_to_real()` is a no-op with `real=None`. All pass.
+
+**Verified live against an actual physical robot (2026-08-20)** — the
+first time one has been reachable from this sandbox. Confirmed via direct
+socket connect + RTDE read (not just ping) that `192.168.1.100` is a real
+UR controller, then ran `ShadowClient.connect()` against it: the simulator
+jumped from its home pose to the real robot's actual live joint angles with
+<0.01 deg residual error, and a follow-up read confirmed the real robot's
+own joints were completely unchanged by the sync (only the simulator ever
+moves for this). This exercised real network behavior (real controller
+RTDE/primary-port connect timing) for the first time, not just the gating
+logic — but deliberately state-reading and sim-only motion so far, not a
+full shadow-mode move through to the real arm; that needs the user present
+with hands on/near the e-stop before it's tried. Before pointing this at a
+physical arm for actual motion: confirm the workspace is clear, someone has
+hands on/near the physical e-stop, and target poses have already been
+proven safe on the simulator alone first.
 
 ## Known gaps (deliberately not built — don't rediscover these as bugs)
 
@@ -502,11 +545,13 @@ simulator alone first.
 cd "international-summer-school-robotics-TER-UR/simulation environment" && docker compose up -d
 # Power on + release brakes at http://localhost until RUNNING
 
-# Case 1 server smoke test (all 31 tools, live)
+# Case 1 server smoke test (all 32 tools, live)
 cd case1 && python3 test_server.py                    # socket backend
 UR_BACKEND=ros2 python3 test_server.py                 # ROS2 backend (driver must be launched)
 UR_REAL_HOST=<real-controller-ip> python3 server.py     # shadow mode: sim-verify, then replay on the real robot
-python3 test_shadow_client.py                           # shadow-gating unit test, no network/robot needed
+                                                         # (192.168.1.100 on this workspace's LAN, 2026-08-20 --
+                                                         # confirm still live before reusing, IPs can change)
+python3 test_shadow_client.py                           # shadow-gating + pose-sync unit test, no network/robot needed
 # Vision-passthrough tools need vision_human_track's API running first (below) --
 # test_server.py skips those specific tests gracefully if it's not reachable.
 # check_path/add_obstacle/remove_obstacle/list_obstacles need move_group running too (below) --
@@ -533,13 +578,15 @@ cd vision_human_track && source venv/bin/activate
 python3 tests/test_math.py && python3 tests/test_smoke.py && python3 tests/test_real_image.py
 docker compose up -d --build && curl http://localhost:8000/health
 python3 live_demo.py                                   # live GUI, needs a camera + display
+python3 live_demo.py --realsense --yolo                 # RealSense camera + object detection
 
-# ROS2 bridge: republishes the Vision Stack as topics (needs the API running above)
+# ROS2 bridge: republishes the Vision Stack as topics
 cd ros2_vision_bridge
 python3 tests/test_geometry.py                          # plain python3, no ROS needed
 source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-python3 vision_bridge_node.py
-python3 safety_stop_demo.py                              # closes the loop: hand -> stop_robot
+python3 vision_bridge_node.py                            # polls vision_human_track's REST API (needs it running above)
+python3 realsense_vision_node.py                         # OR: owns a RealSense directly, no REST API needed, adds /vision/objects_json
+python3 safety_stop_demo.py                              # closes the loop: hand -> stop_robot (works with either bridge above)
 ```
 
 ROS2 driver launch command and calibration are in `ros2_ur_driver/README.md`.

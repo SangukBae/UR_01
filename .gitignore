@@ -3,3 +3,16 @@ __pycache__/
 *.log
 case1/waypoints.json
 case1/programs.json
+
+# Model weights - downloadable, not source; don't bloat the repo
+yolo/*.pt
+
+# Generated detection outputs (annotated images + JSON) - regenerate via
+# the tests/scripts that produce them, not meant to be version-controlled
+*_detected.jpg
+*_detected.json
+*_out.jpg
+vision_human_track/tests/test_image.jpg
+vision_human_track/tests/test_image_detected.jpg
+vision_human_track/tests/test_image_detected.json
+yolo/smoke_test_output.jpg

@@ -1,1 +1,7 @@
-requests
+requests   # only vision_bridge_node.py needs this (polls the REST API)
+
+# Only realsense_vision_node.py needs these (owns the camera + models
+# in-process instead of polling a REST API) -- normally already present in
+# vision_human_track/venv, see its requirements.txt.
+pyrealsense2
+ultralytics   # only if not using --no-yolo

@@ -1,10 +1,19 @@
 # ros2_vision_bridge
 
-Bridges `vision_human_track`'s HTTP REST service into ROS2 topics, so any
-ROS2 node (obstacle avoidance, digital twin, safety fencing) can consume
-human/hand detections without knowing it's a plain HTTP service under the
-hood. Polls `POST /detect/live` on a timer and republishes the JSON as
-ROS2 messages.
+Publishes person/hand/object recognition as ROS2 topics. Two ways to get
+there, same output topics either way:
+
+- **`vision_bridge_node.py`** — bridges `vision_human_track`'s HTTP REST
+  service into ROS2 topics, so any ROS2 node (obstacle avoidance, digital
+  twin, safety fencing) can consume human/hand detections without knowing
+  it's a plain HTTP service under the hood. Polls `POST /detect/live` on a
+  timer and republishes the JSON as ROS2 messages. Works with whatever
+  camera `vision_human_track` happens to have (typically a plain webcam).
+- **`realsense_vision_node.py`** — talks to an attached Intel RealSense
+  directly via `pyrealsense2` and runs detection in-process, no REST
+  service needed. Adds object detection (YOLO, a teammate's `../yolo/`
+  module) on top of person/hand, publishing an extra `/vision/objects_json`
+  topic. Use this one for the robot-arm-mounted RealSense specifically.
 
 **No colcon package, on purpose** — matches this repo's existing
 `ros2_ur_driver/ros2_client.py` convention (plain rclpy script, not an
@@ -50,19 +59,53 @@ parameters:
 python3 vision_bridge_node.py --ros-args -p vision_api_url:=http://192.168.1.50:8000 -p poll_rate_hz:=5.0
 ```
 
+## realsense_vision_node.py — RealSense, in-process, with object detection
+
+```bash
+source /opt/ros/humble/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+cd ../vision_human_track && source venv/bin/activate && cd ../ros2_vision_bridge
+pip install pyrealsense2   # once, if not already in that venv
+python3 realsense_vision_node.py               # person + hand + object
+python3 realsense_vision_node.py --no-yolo      # person + hand only, skips loading YOLO
+python3 realsense_vision_node.py --ros-args -p poll_rate_hz:=5.0 -p camera_frame_id:=camera_link
+```
+
+Needs a RealSense attached and visible to Linux — on WSL2 that means
+`usbipd bind`/`attach` first (same dance as the plain webcam, see
+`vision_human_track/README.md`'s known gaps; `usbipd list` on Windows
+shows the busid, look for "Intel(R) RealSense"). Object detection also
+needs `../yolo/yolo26n.pt` + `ultralytics` installed (same as
+`vision_human_track/live_demo.py --yolo`) — `--no-yolo` skips both if you
+just want person/hand.
+
+**Verified live (2026-08-20)** against a real RealSense D435 (WSL2 +
+usbipd-win passthrough, busid `2-1`): all four topics carried real data —
+`/vision/hands` at ~5.8 Hz average (person+hand+object inference per frame
+on CPU is heavier than person+hand alone, matching `live_demo.py --yolo`'s
+documented FPS drop), `/vision/objects_json` returning real YOLO detections
+(e.g. `class_name: "person"`), `/vision/humans_json` and
+`/vision/humans_markers` matching `vision_bridge_node.py`'s existing
+shapes exactly (reuses its `build_hands_msg`/`build_markers_msg`). Hit the
+same DDS-discovery flakiness noted below — `ros2 topic list`/`echo` hung
+until `ros2 daemon stop && ros2 daemon start`, unrelated to this node's
+own code.
+
 ## Topics published
 
-| Topic | Type | Contents |
-|---|---|---|
-| `/vision/hands` | `geometry_msgs/PoseArray` | One `Pose` per detected hand: `position` = palm center, `orientation` = a quaternion whose local +Z axis points along the palm normal (see `geometry.py`'s `quat_from_z_axis` docstring — this fixes 2 of 3 rotational DOF, not the hand's roll). |
-| `/vision/humans_markers` | `visualization_msgs/MarkerArray` | One `LINE_LIST` marker per detected person (simplified limb/torso skeleton) — viewable directly in RViz, zero custom-message parsing needed. |
-| `/vision/humans_json` | `std_msgs/String` | The vision service's raw JSON response, one message per poll — full 33-point skeleton, all 21 hand landmarks per hand, IDs, unassigned hands. Everything the two typed topics above don't carry, without needing a custom `.msg` package. |
+| Topic | Type | Contents | Published by |
+|---|---|---|---|
+| `/vision/hands` | `geometry_msgs/PoseArray` | One `Pose` per detected hand: `position` = palm center, `orientation` = a quaternion whose local +Z axis points along the palm normal (see `geometry.py`'s `quat_from_z_axis` docstring — this fixes 2 of 3 rotational DOF, not the hand's roll). | both |
+| `/vision/humans_markers` | `visualization_msgs/MarkerArray` | One `LINE_LIST` marker per detected person (simplified limb/torso skeleton) — viewable directly in RViz, zero custom-message parsing needed. | both |
+| `/vision/humans_json` | `std_msgs/String` | The vision service's raw JSON response, one message per poll/frame — full 33-point skeleton, all 21 hand landmarks per hand, IDs, unassigned hands. Everything the two typed topics above don't carry, without needing a custom `.msg` package. | both |
+| `/vision/objects_json` | `std_msgs/String` | `{"objects": [...], "frame_width": W, "frame_height": H}` — one YOLO detection per object (`class_name`, `instance_name`, `confidence`, pixel `xyxy` box at that frame's resolution). 2D only, no depth fusion. | `realsense_vision_node.py` only |
 
 **Coordinate frame**: everything is in the vision service's own output
-frame — camera-relative, normalized `[0,1]` image x/y, MediaPipe's
-relative z. **Not** robot/world coordinates. Per the team's first
-architecture meeting, transforming this into robot coordinates is a
-separate ROS-side job, deliberately not done here.
+frame — camera-relative, normalized `[0,1]` image x/y for hands/skeleton
+(MediaPipe's relative z), pixel coordinates for object boxes (YOLO).
+**Not** robot/world coordinates. Per the team's first architecture
+meeting, transforming this into robot coordinates is a separate ROS-side
+job, deliberately not done here.
 
 ## Verified live (2026-08-19)
 
@@ -146,3 +189,16 @@ this running to see the whole thing end-to-end with a real hand.
   only publishes; nothing currently subscribes to `/vision/hands` to
   actually stop or slow the robot. That's the ROS/digital-twin side's
   work per the team's architecture.
+- **`realsense_vision_node.py`'s image is rotated relative to upright** —
+  the RealSense is mounted vertically on the robot arm, not level, so
+  every frame (and therefore every normalized x/y in `/vision/hands`,
+  `/vision/humans_json`, `/vision/objects_json`) comes out ~90° rotated
+  from what a human would call "upright." Not corrected in code — no
+  single rotation is right for every mount, so a consumer that cares about
+  actual up/down or left/right should account for the real mount angle
+  itself rather than assume this node's frame is upright.
+- **`realsense_vision_node.py` + object detection is CPU-heavy** — two
+  models (MediaPipe + YOLO) per frame measured ~5.8 Hz average on this
+  sandbox's CPU, well under the requested 10 Hz — same tradeoff
+  `vision_human_track/live_demo.py --yolo` already documents. `--no-yolo`
+  gets back to person/hand-only speed if object detection isn't needed.

@@ -186,7 +186,12 @@ curl http://localhost:8000/health
 
 # Live GUI demo (local venv only, not through Docker - needs a display):
 python3 live_demo.py
+python3 live_demo.py --realsense --yolo   # RealSense camera + object detection too
 ```
+
+For continuous headless ROS2 publishing from a RealSense (no GUI, no
+Docker) instead of this local demo, see `../ros2_vision_bridge/
+realsense_vision_node.py`.
 
 ## Tests
 
@@ -224,6 +229,23 @@ normal-vector arrows pointing in a geometrically plausible direction.
   camera doesn't show up in `usbipd list` at all, it's likely MIPI CSI, not
   USB — `usbipd` categorically can't pass those through; live-camera work
   would need to happen outside WSL2/Docker on native Windows Python instead.
+- **RealSense camera: working, verified (2026-08-20), WSL2 + `usbipd-win`.**
+  Same passthrough dance as the plain webcam (`usbipd bind`/`attach --wsl`,
+  admin PowerShell) but a different busid/VID:PID — `usbipd list` shows it
+  as "Intel(R) RealSense(TM) Depth Camera 435 ...", not a generic webcam
+  name. `src/realsense_camera.py`'s `RealSenseCapture` wraps
+  `pyrealsense2`'s color stream behind the same `read()`/`release()`
+  interface `live_demo.py`/`api.py` already use for `cv2.VideoCapture`, so
+  none of the MJPG-fourcc/warm-up-frame logic needed for the plain-webcam
+  case applies here — RealSense streams through its own librealsense
+  pipeline, not cv2's V4L2 backend. Verified end-to-end: real color frames
+  in, correct hand detection out (`live_demo.py --realsense --yolo`, and
+  headless via `../ros2_vision_bridge/realsense_vision_node.py`). Depth
+  stream is also opened (`RealSenseCapture.last_depth_frame`) but nothing
+  in this repo consumes it yet. Known cosmetic issue: the camera is
+  mounted vertically on the robot arm, so frames come out ~90° rotated
+  from upright — not corrected in code, see `ros2_vision_bridge/
+  README.md`'s known gaps.
 - **Hand-orientation sign convention (Left vs Right flip in
   `_palm_center_and_normal`) is still a geometric assumption, not
   confirmed against a real hand with known orientation.** The live demo
