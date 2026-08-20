@@ -47,6 +47,15 @@ below, not a large multi-person test set).
   (mediapipe pulls it in) and a display (WSLg on Windows, or any real X11/
   Wayland session) — won't work through the Docker image, which stays
   headless since it's a server with no display.
+- `detect_photo.py` — local-only single-image CLI (not part of the API):
+  `python3 detect_photo.py path/to/image.jpg` runs this service's own
+  detection once and writes `<stem>_detected.jpg` (annotated) +
+  `<stem>_detected.json` (full result) next to the input. `--yolo` also
+  runs `../yolo/`'s YOLO26 object detection on the same image and adds an
+  `"objects"` array to the JSON — see "Output coordinates in detail" below
+  for why that array's coordinates are NOT in the same frame as everything
+  else in the file. This is a convenience script for eyeballing detection
+  on a still photo, not a REST endpoint.
 
 ## Coordinate frame — scope boundary
 
@@ -81,6 +90,52 @@ Response shape:
 }
 ```
 
+## Output coordinates in detail
+
+Two different coordinate systems appear in this service's output — don't
+mix them up:
+
+**`humans[].skeleton`, `humans[].hands[]`, `unassigned_hands[]` — all
+normalized [0,1] image coordinates + relative depth** (this is the
+"Coordinate frame — scope boundary" above, broken down field by field):
+
+- **`x`, `y`** (skeleton points, hand `landmarks`, and `palm_center`'s
+  first two values): fraction of image width/height, `(0,0)` = top-left of
+  the frame, `(1,1)` = bottom-right. NOT pixels.
+- **`z`**: relative depth, roughly the same scale as x/y, zeroed at a
+  reference point (hip midpoint for the pose skeleton; the hand's own
+  wrist for hand landmarks) — smaller (more negative) means closer to the
+  camera than that reference. Not metres, not comparable across a pose
+  skeleton and a hand's landmarks (different reference points).
+- **`visibility`** (skeleton points only): 0-1 confidence the model has
+  that joint, not occluded. Low values (e.g. legs out of frame) mean
+  "estimated, possibly unreliable," not "wrong coordinates" — the x/y/z
+  are still MediaPipe's best guess, just flagged as uncertain.
+- **`palm_center`**: mean of the wrist + 4 finger-MCP landmarks (5 of the
+  21 hand `landmarks`) — a derived summary point, same coordinate system
+  as everything else here.
+- **`normal`**: a unit vector (length 1, not a position) — which way the
+  palm faces. Computed as `cross(wrist->index_mcp, wrist->pinky_mcp)`,
+  sign-flipped for `"Left"` hands so it points out of the palm regardless
+  of handedness (see Known gaps — this flip isn't yet confirmed against a
+  real hand of known orientation).
+- **`id`** (per human): a tracking ID across frames/calls, not a
+  coordinate — see Known gaps for its stability caveats.
+
+**`detect_photo.py --yolo`'s `"objects"` array — raw pixel coordinates,
+a different frame entirely:**
+
+- **`xyxy`**: `[x1, y1, x2, y2]` bounding box corners in the ORIGINAL
+  IMAGE'S PIXELS (e.g. `2108.0` for a ~2000px-wide photo) — not
+  normalized to [0,1] like everything above. Values over 1 are the
+  giveaway if you're not sure which array you're looking at.
+- This array only appears via `detect_photo.py --yolo` (a local
+  convenience script combining this service's own output with a
+  teammate's separate YOLO module for one still image) — it is NOT part
+  of `/detect/image` or `/detect/live`'s response; the actual REST API
+  never returns object detections (see "Object detection is intentionally
+  not here" in Known gaps).
+
 ## WSL2: attach a USB webcam first
 
 Skip this if you're not on WSL2, or if `ls /dev/video*` already shows a
@@ -99,6 +154,18 @@ usbipd attach --wsl --busid <BUSID>    # needed again after every reboot/sleep
 # Back in WSL2:
 ls /dev/video*   # should now show at least /dev/video0
 ```
+
+If `ls /dev/video*` still shows nothing even though `usbipd list` says the
+device is `Attached`, the `uvcvideo` kernel module likely isn't loaded —
+check with `lsmod | grep uvc` and load it if missing:
+
+```bash
+sudo modprobe uvcvideo
+ls /dev/video*   # should now show at least /dev/video0
+```
+
+This resets on every WSL2 restart along with the `usbipd attach`, so both
+steps are needed again after a reboot/sleep, not just the Windows-side one.
 
 If the camera never shows up in `usbipd list` at all, it's likely a
 built-in MIPI CSI camera, not USB — `usbipd` can't pass those through;
@@ -148,7 +215,12 @@ normal-vector arrows pointing in a geometrically plausible direction.
   default raw-YUYV format over this specific USB-passthrough transport)
   came back as a solid green image — fixed by forcing `CAP_PROP_FOURCC` to
   MJPG and discarding ~10 warm-up frames before trusting the feed (see
-  `live_demo.py` and `src/api.py`'s `_get_camera`). If a teammate's laptop
+  `live_demo.py` and `src/api.py`'s `_get_camera`). Also found: even after
+  `usbipd attach` shows the device as `Attached`, OpenCV can still fail with
+  "can't open camera by index" / "Camera index out of range" if the
+  `uvcvideo` kernel module isn't loaded (`lsmod | grep uvc` empty,
+  `/dev/video*` missing) — `sudo modprobe uvcvideo` fixes it immediately;
+  see the WSL2 section above. If a teammate's laptop
   camera doesn't show up in `usbipd list` at all, it's likely MIPI CSI, not
   USB — `usbipd` categorically can't pass those through; live-camera work
   would need to happen outside WSL2/Docker on native Windows Python instead.
