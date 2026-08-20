@@ -80,7 +80,14 @@ Repo layout:
   alongside for a combined demo. `live_demo.py` is a local-only live-camera
   GUI preview (not part of the API) — `--realsense` points it at an
   attached Intel RealSense (`src/realsense_camera.py`, via pyrealsense2)
-  instead of a plain `cv2.VideoCapture` index. Verified live against both a
+  instead of a plain `cv2.VideoCapture` index. With `--realsense`, every
+  hand and (with `--yolo`) every object also gets a real `distance_m`
+  (metres, from the depth sensor, aligned to the color frame via
+  `rs.align` — `RealSenseCapture.get_distance` reads a median over a small
+  pixel ROI rather than one raw sample, since individual depth pixels are
+  commonly 0/invalid at edges and reflective surfaces) — see "Verified
+  findings" below for what's actually been confirmed against real
+  hardware vs. only logic-tested. Verified live against both a
   real webcam and a real RealSense D435 (both WSL2 + usbipd-win
   passthrough, different busid/VID:PID per device) — see its README for
   the API contract and known gaps (handedness sign convention still not
@@ -94,13 +101,21 @@ Repo layout:
   `/vision/humans_json`) — verified live at 10Hz against the real webcam +
   vision service. `realsense_vision_node.py` instead owns an attached
   RealSense directly (no REST service in between) and runs MediaPipe +
-  YOLO in-process, adding a fourth topic (`/vision/objects_json`) for
-  object detections — verified live against the real RealSense D435 at
-  ~5.8Hz (person+hand+object inference on CPU is heavier than person+hand
-  alone). Both share their message-building code
-  (`vision_bridge_node.py`'s `build_hands_msg`/`build_markers_msg`), so any
-  existing consumer works unchanged regardless of which one is running.
-  Also has `safety_stop_demo.py`
+  YOLO in-process, adding a fourth topic (`/vision/objects_json`, also
+  carrying `distance_m`) for object detections — verified live against the
+  real RealSense D435 at ~5.8Hz (person+hand+object inference on CPU is
+  heavier than person+hand alone). `vision_human_track/live_demo.py
+  --realsense --yolo --ros2` publishes this exact same four-topic set
+  in-process, so one command gets both the GUI window and the full topic
+  set — no separate node needed if you also want to see the picture (the
+  two scripts still can't run at once, though — one camera, one process).
+  Both bridge scripts share their message-building code
+  (`vision_bridge_node.py`'s `build_hands_msg`/`build_markers_msg`, and
+  `live_demo.py`'s `add_distances`), so any existing consumer works
+  unchanged regardless of which one is running. `cyclonedds_localhost.xml`
+  is an opt-in CycloneDDS config that fixes this sandbox's DDS-discovery
+  hang for vision-only work — see "Verified findings" below, do NOT set it
+  globally. Also has `safety_stop_demo.py`
   — subscribes to `/vision/hands` and calls `stop_robot` on any hand
   presence, closing the vision→ROS2→robot-stop loop end to end (talks to
   the robot directly, not through the MCP layer — a safety reaction
@@ -347,6 +362,78 @@ local Whisper) and adds spoken replies via `tts.py` (`espeak-ng` →
   end of `connect()`, mirroring `ROS2URClient` exactly — same pattern,
   independently rediscovered. If a new class wraps an `rclpy` node, give it
   this from the start rather than waiting to hit the crash.
+- **Running a vision script without activating `vision_human_track/venv`
+  first crashes with a numpy/cv2 ABI mismatch, not an obvious "wrong
+  python" error.** Found live: `python3 realsense_vision_node.py` from a
+  plain shell (no venv activated) failed importing `cv2` with `AttributeError:
+  _ARRAY_API not found` → `ImportError: numpy.core.multiarray failed to
+  import`. Root cause: the system's `python3` (`/usr/bin/python3`) picks up
+  `/usr/lib/python3/dist-packages/cv2...so` — an apt-installed cv2 (pulled
+  in by a ROS package) built against numpy 1.x — while the system's own
+  numpy is 2.2.6. Same *category* of bug as the openwakeword/scipy ABI
+  mismatch above, different package, different fix: there's no upgrade
+  path for the apt cv2, so the fix is just "activate the venv" (it has a
+  matched numpy+opencv-contrib-python pair) — `source vision_human_track/
+  venv/bin/activate` before running any script that imports `cv2`/
+  `mediapipe`, exactly as every README's run commands already show. Check
+  `which python3` if this error shows up again — if it says `/usr/bin/
+  python3`, the venv isn't active.
+- **Only one process can hold the RealSense at a time.** Found live: with
+  `realsense_vision_node.py` already running, starting `live_demo.py
+  --realsense` in another terminal raised `RuntimeError: RealSense device
+  found but its color/depth pipeline failed to start.` — pyrealsense2
+  finds the device fine (it's still enumerable) but a second `pipeline.
+  start()` fails outright. Not a bug, just means: before switching between
+  `live_demo.py`, `realsense_vision_node.py`, or any other script that
+  opens the camera, stop whichever one is already running first
+  (`pgrep -af realsense_vision_node.py`/`live_demo.py`, `kill`).
+- **Real depth (`distance_m`) added 2026-08-20** — `RealSenseCapture.
+  get_distance(x, y)` in `vision_human_track/src/realsense_camera.py`;
+  `add_distances()`/`draw_distances()` in `live_demo.py` (imported and
+  reused, not duplicated, by `realsense_vision_node.py`). Only two things
+  get a distance: each hand's `palm_center` pixel and (with `--yolo`) each
+  YOLO box's center pixel — skeleton joints don't. **Verified with
+  synthetic depth data only** (median/outlier-rejection, out-of-bounds,
+  no-depth-frame-yet, all covered) — the RealSense was disconnected from
+  this sandbox mid-build. It has since been reattached and run live by the
+  user (`realsense_vision_node.py` publishing real `/vision/objects_json`/
+  `/vision/humans_json` with non-null `distance_m` values), so the
+  end-to-end path is exercised, but nobody has yet checked a `distance_m`
+  reading against an object at an actually-known distance — treat the
+  *numbers* as unverified until that specific check happens, even though
+  the plumbing clearly works.
+
+## Team repo sync (tom-bourjala/UR-MCP)
+
+The vision work in this repo (`vision_human_track/`, `ros2_vision_bridge/`,
+and `../yolo/` minus its model weights/generated images) is also mirrored
+to the team's shared GitHub repo, a completely separate remote from this
+repo's own `origin` (`SangukBae/UR_01`):
+`https://github.com/tom-bourjala/UR-MCP.git`, branch
+`vision/human-hand-tracking`.
+
+**This is a manual sync, not an automated one** — there's no second git
+remote configured in *this* repo pointing at it. The actual process, done
+several times this session: clone `tom-bourjala/UR-MCP` fresh into a
+scratch directory on the `vision/human-hand-tracking` branch, `diff -q`
+every relevant file against this repo's current copy to find exactly
+what's new/changed (that branch's history is its own — different commit
+hashes than this repo even for identical content, since it was originally
+seeded by copying files, not a shared ancestry), copy over just the
+delta, commit with `--author="SangukBae <halmoney956@gmail.com>"` (the
+sandbox's git identity auto-detects as `root@<hostname>` otherwise — always
+override it), and push. That team repo's root has its own `README.md` —
+a plain command list (setup/run commands only, no explanations) covering
+`vision_human_track`, `ros2_vision_bridge`, and `yolo` — kept manually in
+sync with whatever's actually runnable there; update it in the same pass
+whenever new run commands are added here.
+
+**When asked to "push to the team repo" again**, don't assume a prior
+session's scratch clone is still around or current — re-clone (or
+`git fetch` + check) fresh, since this repo's own `origin` and that repo
+diverge independently and either could have moved. Case1/CLAUDE.md/etc.
+never belong on that branch — it has no root docs of its own beyond the
+command-list README, and case1 isn't vision-stack scope.
 
 ## Block-diagram cross-check
 
@@ -604,12 +691,15 @@ cd vision_human_track && source venv/bin/activate
 python3 tests/test_math.py && python3 tests/test_smoke.py && python3 tests/test_real_image.py
 docker compose up -d --build && curl http://localhost:8000/health
 python3 live_demo.py                                   # live GUI, needs a camera + display
-python3 live_demo.py --realsense --yolo                 # RealSense camera + object detection
+python3 live_demo.py --realsense --yolo                 # RealSense camera + object detection (+ distance_m)
+python3 live_demo.py --realsense --yolo --ros2           # same, AND publishes all 4 /vision/* topics at once
+                                                          # (needs /opt/ros/humble/setup.bash + RMW_IMPLEMENTATION first)
 
 # ROS2 bridge: republishes the Vision Stack as topics
 cd ros2_vision_bridge
 python3 tests/test_geometry.py                          # plain python3, no ROS needed
 source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI="file://$(pwd)/cyclonedds_localhost.xml"   # optional, fixes flaky discovery - see Verified findings
 python3 vision_bridge_node.py                            # polls vision_human_track's REST API (needs it running above)
 python3 realsense_vision_node.py                         # OR: owns a RealSense directly, no REST API needed, adds /vision/objects_json
 python3 safety_stop_demo.py                              # closes the loop: hand -> stop_robot (works with either bridge above)
