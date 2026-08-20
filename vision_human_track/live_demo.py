@@ -13,6 +13,8 @@ draws skeleton/palm-center/orientation overlay, shows it in a window.
                                        # pyrealsense2` in this venv first
     python3 live_demo.py --ros2       # also publish /vision/hands,
                                        # /vision/humans_markers, /vision/humans_json
+                                       # (+ /vision/objects_json if --yolo is
+                                       # also given)
                                        # (source /opt/ros/humble/setup.bash +
                                        # RMW_IMPLEMENTATION first, same as
                                        # ros2_vision_bridge/README.md)
@@ -30,11 +32,14 @@ surface, etc.) -- not shown on plain-webcam runs, which have no depth.
 Press 'q' in the window to quit.
 
 --ros2 builds and publishes the same topics as
-ros2_vision_bridge/vision_bridge_node.py, but in-process from this script's
-own camera read/detect loop instead of polling vision_human_track's REST API
--- so it works without api.py running, and without two processes fighting
-over the same camera device. Don't run this alongside vision_bridge_node.py
-at the same time -- both would publish onto the same topic names.
+ros2_vision_bridge/vision_bridge_node.py (+ /vision/objects_json, same as
+realsense_vision_node.py, when --yolo is also given), but in-process from
+this script's own camera read/detect loop instead of polling
+vision_human_track's REST API or owning the camera in a separate node --
+so this one script alone can show the GUI window AND publish every topic
+realsense_vision_node.py does. Don't run this alongside vision_bridge_node.py
+or realsense_vision_node.py at the same time -- they'd publish onto the
+same topic names, and two processes can't share one camera device anyway.
 
 --yolo runs ../yolo/'s object-detection model (a teammate's module, not
 part of this user's human/hand assignment) on every frame alongside
@@ -207,8 +212,11 @@ def main():
             "markers": ros_node.create_publisher(MarkerArray, "/vision/humans_markers", 10),
             "json": ros_node.create_publisher(String, "/vision/humans_json", 10),
         }
-        print("ROS2 publishing enabled: /vision/hands, /vision/humans_markers, "
-              "/vision/humans_json")
+        topics = "/vision/hands, /vision/humans_markers, /vision/humans_json"
+        if args.yolo:
+            ros_pubs["objects"] = ros_node.create_publisher(String, "/vision/objects_json", 10)
+            topics += ", /vision/objects_json"
+        print(f"ROS2 publishing enabled: {topics}")
 
     if args.realsense:
         from realsense_camera import RealSenseCapture, list_realsense_devices
@@ -290,6 +298,10 @@ def main():
                 ros_pubs["hands"].publish(build_hands_msg(result, stamp, "camera_link"))
                 ros_pubs["markers"].publish(build_markers_msg(result, stamp, "camera_link"))
                 ros_pubs["json"].publish(String(data=json.dumps(result)))
+                if "objects" in ros_pubs and yolo_detections is not None:
+                    ros_pubs["objects"].publish(String(data=json.dumps({
+                        "objects": yolo_detections, "frame_width": width, "frame_height": height,
+                    })))
                 rclpy.spin_once(ros_node, timeout_sec=0)
 
             annotated = draw_result(bgr, result)
