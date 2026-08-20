@@ -11,7 +11,7 @@ backends).
 
 | File | Role |
 |------|------|
-| `server.py` | the MCP server (27 tools): `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `move_robot_queued` + `get_queue` (extra, non-blocking move with reject/queue/override semantics), `save_waypoint`/`list_waypoints`/`delete_waypoint`/`move_robot_to_waypoint`/`free_drive` (extra, named-pose database + hand-guided teaching), `move_robot_to_position_relative`/`move_robot_linear_relative`/`move_robot_linear_sequence` (extra, delta/multi-pose variants), `program_new`/`list_programs`/`program_delete`/`program_start`/`program_stop` (extra, named waypoint sequences), `get_vision`/`get_environment`/`get_environment_shadow` (extra, MCP-level passthrough to `vision_human_track`), `track` (extra, crude 1-DOF demo -- see its docstring), `example` (template) |
+| `server.py` | the MCP server (31 tools): `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `move_robot_queued` + `get_queue` (extra, non-blocking move with reject/queue/override semantics), `save_waypoint`/`list_waypoints`/`delete_waypoint`/`move_robot_to_waypoint`/`free_drive` (extra, named-pose database + hand-guided teaching), `move_robot_to_position_relative`/`move_robot_linear_relative`/`move_robot_linear_sequence` (extra, delta/multi-pose variants), `program_new`/`list_programs`/`program_delete`/`program_start`/`program_stop` (extra, named waypoint sequences), `get_vision`/`get_environment`/`get_environment_shadow` (extra, MCP-level passthrough to `vision_human_track`), `track` (extra, crude 1-DOF demo -- see its docstring), `check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles` (extra, MoveIt-backed path checking + obstacle avoidance, see ./motion_planner.py), `example` (template) |
 | `queue_manager.py` | background-thread command queue backing `move_robot_queued`/`get_queue`/`program_start` -- the non-blocking layer that makes `stop_robot` able to genuinely interrupt a move within one chat turn |
 | `waypoint_store.py` | plain JSON-file-backed waypoint database (`waypoints.json`, gitignored -- local/runtime data) backing the waypoint tools |
 | `program_store.py` | plain JSON-file-backed program database (`programs.json`, gitignored) -- named ordered lists of waypoint names, backing the program tools |
@@ -129,7 +129,7 @@ claude mcp list
 ```
 
 GUI clients (Bionic, OpenClaw, Cursor, Claude Desktop): MCP entry, command
-`python3`, arg the absolute path to `server.py` (27 tools on probe). Course
+`python3`, arg the absolute path to `server.py` (31 tools on probe). Course
 guides for Bionic/OpenClaw:
 [`llm-client/self-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/self-hosted.md),
 [`llm-client/cloud-hosted.md`](https://github.com/ureskr/international-summer-school-robotics-TER-UR/blob/main/llm-client/cloud-hosted.md)

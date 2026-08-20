@@ -1297,6 +1297,135 @@ def track(duration_s: float = 10.0, poll_hz: float = 2.0) -> dict:
 
 
 # =========================================================================== #
+# PATH CHECKING / OBSTACLE AVOIDANCE  --  block-diagram tool list. Closes the
+# "genuinely not built, needs a real motion planner" gap from ../CLAUDE.md's
+# block-diagram cross-check. Backed by MoveIt (motion_planner.py), talking to
+# move_group's planning services directly -- a separate ROS2 process from
+# either robot backend, so this needs move_group AND ur_robot_driver launched
+# regardless of UR_BACKEND (socket or ros2) -- see ../CLAUDE.md's Running
+# things section for both launch commands. Lazy-connected on first use (like
+# the vision passthrough tools above) so nothing here breaks a run that never
+# calls these tools -- e.g. test_server.py's default socket-backend pass.
+# =========================================================================== #
+_planner = None
+_planner_lock = threading.Lock()
+
+
+def _get_planner():
+    global _planner
+    with _planner_lock:
+        if _planner is None:
+            from motion_planner import MotionPlanner
+
+            planner = MotionPlanner()
+            try:
+                planner.connect(timeout_s=5.0)
+            except ConnectionError as exc:
+                raise RuntimeError(
+                    f"MoveIt not reachable ({exc}). Is move_group launched "
+                    "(ros2 launch ur_moveit_config ur_moveit.launch.py "
+                    "ur_type:=ur10 ...)? See ../CLAUDE.md's Running things "
+                    "section."
+                ) from exc
+            _planner = planner
+    return _planner
+
+
+@mcp.tool
+def check_path(joint_angles_deg: list[float]) -> dict:
+    """Ask MoveIt whether a collision-free path exists from the robot's
+    current joint configuration to a target one, WITHOUT moving the robot --
+    a pre-flight check before committing to move_robot_to_position et al.
+
+    Args:
+        joint_angles_deg: Six target angles in degrees, base..wrist3 (same
+            order/units as move_robot_to_position).
+
+    Returns:
+        A dict: ``feasible`` (bool). If not feasible, ``reason`` -- either
+        "goal state is in collision" (+ ``colliding_pairs``, the specific
+        link/obstacle names touching) or "no collision-free path found"
+        (goal itself is clear, but nothing connects it to the current pose
+        within the planning budget -- likely an obstacle blocking the way).
+        If feasible, ``waypoints`` (planned trajectory point count).
+
+    Raises:
+        ValueError: Wrong number of angles.
+        RuntimeError: MoveIt (move_group) isn't reachable.
+    """
+    from motion_planner import ros_joint_dict
+
+    if len(joint_angles_deg) != len(JOINT_NAMES):
+        raise ValueError(
+            f"Expected {len(JOINT_NAMES)} joint angles "
+            f"({', '.join(JOINT_NAMES)}), got {len(joint_angles_deg)}."
+        )
+    target_rad = [math.radians(a) for a in joint_angles_deg]
+    return _get_planner().check_path(ros_joint_dict(target_rad))
+
+
+@mcp.tool
+def add_obstacle(
+    obstacle_id: str, xyz_m: list[float], size_m: list[float],
+) -> dict:
+    """Add (or replace, same obstacle_id) a box obstacle in the planning
+    scene, so check_path (and MoveIt planning generally) routes around it.
+
+    Args:
+        obstacle_id: Name for this obstacle -- reuse it to move/resize an
+            existing one, or to remove_obstacle it later.
+        xyz_m: [x, y, z] box centre, metres, base_link frame (same frame as
+            tcp_pose's x/y/z).
+        size_m: [x, y, z] full box extents, metres.
+
+    Returns:
+        ``{"status": "added", "obstacle_id": ..., "obstacles": [...]}`` --
+        every obstacle currently registered, for confirmation.
+
+    Raises:
+        ValueError: xyz_m or size_m isn't length 3.
+        RuntimeError: MoveIt (move_group) isn't reachable.
+    """
+    if len(xyz_m) != 3 or len(size_m) != 3:
+        raise ValueError("xyz_m and size_m must each have exactly 3 values.")
+    planner = _get_planner()
+    planner.add_box_obstacle(obstacle_id, tuple(xyz_m), tuple(size_m))
+    return {"status": "added", "obstacle_id": obstacle_id, "obstacles": planner.list_obstacles()}
+
+
+@mcp.tool
+def remove_obstacle(obstacle_id: str) -> dict:
+    """Remove a previously added obstacle by id. No error if it doesn't
+    exist -- MoveIt's remove is a no-op in that case, not a rejection.
+
+    Returns:
+        ``{"status": "removed", "obstacle_id": ..., "obstacles": [...]}``.
+
+    Raises:
+        RuntimeError: MoveIt (move_group) isn't reachable.
+    """
+    planner = _get_planner()
+    planner.remove_obstacle(obstacle_id)
+    return {"status": "removed", "obstacle_id": obstacle_id, "obstacles": planner.list_obstacles()}
+
+
+@mcp.tool
+def list_obstacles() -> dict:
+    """Every obstacle currently registered in the planning scene.
+
+    Returns:
+        ``{"obstacles": [{"id", "xyz_m", "size_m"}, ...]}`` -- nested under
+        a named key rather than returned as a bare list, since an empty
+        result would otherwise be indistinguishable from a broken call (see
+        list_waypoints's docstring for the same reasoning).
+
+    Raises:
+        RuntimeError: MoveIt (move_group) isn't reachable.
+    """
+    return {"obstacles": _get_planner().list_obstacles()}
+
+
+# =========================================================================== #
 # EMERGENCY STOP  --  team requirement, not one of the four tiers: halt any
 # motion in progress right now, not the next command in a queue.
 # =========================================================================== #

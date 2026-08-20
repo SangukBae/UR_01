@@ -49,6 +49,7 @@ async def main() -> None:
             "program_start", "program_stop",
             "get_vision", "get_environment", "get_environment_shadow",
             "track",
+            "check_path", "add_obstacle", "remove_obstacle", "list_obstacles",
         }, names
         print("tools:", names)
 
@@ -341,6 +342,44 @@ async def main() -> None:
                 print("bad track duration rejected:", str(exc).splitlines()[-1].strip())
             else:
                 raise AssertionError("non-positive track duration was accepted")
+
+        # PATH CHECKING / OBSTACLE AVOIDANCE: needs move_group (MoveIt)
+        # actually launched -- optional dependency, same skip-gracefully
+        # pattern as the vision passthrough block above.
+        try:
+            baseline = await client.call_tool("check_path", {"joint_angles_deg": HOME_DEG})
+            moveit_available = True
+        except Exception as exc:
+            moveit_available = False
+            print(f"MoveIt unreachable, skipping path-checking tests: {exc}")
+
+        if moveit_available:
+            assert baseline.data["feasible"], baseline.data
+            print(f"check_path (home, no obstacle): feasible, {baseline.data['waypoints']} waypoints")
+
+            # A box obstacle placed right where the target joint config's
+            # links would be should make that goal infeasible -- proves
+            # add_obstacle actually reaches the planner, not just storage.
+            added = await client.call_tool("add_obstacle", {
+                "obstacle_id": "test_wall", "xyz_m": [0.0, -0.5, 0.5], "size_m": [0.2, 1.5, 1.5],
+            })
+            assert any(o["id"] == "test_wall" for o in added.data["obstacles"]), added.data
+            blocked = await client.call_tool("check_path", {"joint_angles_deg": [90, -90, 0, -90, 0, 0]})
+            assert not blocked.data["feasible"], blocked.data
+            print("check_path (with obstacle):", blocked.data["reason"])
+
+            removed = await client.call_tool("remove_obstacle", {"obstacle_id": "test_wall"})
+            assert not any(o["id"] == "test_wall" for o in removed.data["obstacles"]), removed.data
+            cleared = await client.call_tool("check_path", {"joint_angles_deg": [90, -90, 0, -90, 0, 0]})
+            assert cleared.data["feasible"], cleared.data
+            print("check_path (after remove_obstacle): feasible again")
+
+            try:
+                await client.call_tool("check_path", {"joint_angles_deg": [0, 0, 0]})
+            except Exception as exc:
+                print("bad check_path angle count rejected:", str(exc).splitlines()[-1].strip())
+            else:
+                raise AssertionError("check_path with wrong angle count was accepted")
 
         # QUEUE: move_robot_queued / get_queue / stop_robot's queue-cancel
         # behavior -- the team's non-blocking architecture design. Deliberately

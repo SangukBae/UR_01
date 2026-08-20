@@ -27,13 +27,14 @@ watches people/objects in the scene for both safety and non-destructive
 This repo covers: the MCP server + both robot backends (this user's Case
 1 assignment, done), the vision stack's human/hand half (this user's team
 assignment, done), a ROS2 bridge + safety-stop demo tying vision to the
-robot (built past-assignment, to close the loop end to end), and an LLM
-chat client. It does NOT cover: real motion planning (digital twin, path
-checking, obstacle avoidance — would need something like MoveIt), object
-detection (a different teammate's module), or real spatial safety fencing
-(needs camera↔robot calibration, not built) — see "Known gaps" and the
-block-diagram cross-check below for the full picture of what's covered
-vs. not.
+robot (built past-assignment, to close the loop end to end), MoveIt-backed
+path checking + obstacle avoidance (added 2026-08-20, see below), and an
+LLM chat client. It does NOT cover: a real Digital Twin (3D visualization/
+mirrored simulation state — path checking and obstacle avoidance now exist,
+but there's no 3D scene view), object detection (a different teammate's
+module), or real spatial safety fencing (needs camera↔robot calibration,
+not built) — see "Known gaps" and the block-diagram cross-check below for
+the full picture of what's covered vs. not.
 
 ## Status
 
@@ -47,14 +48,20 @@ official spec: a `stop_robot` tool, a non-blocking command queue
 team's own architecture-meeting design — a standalone LLM chat client with
 voice I/O, a ROS2 driver integration, a standalone Vision Stack service
 (human detection + hand tracking), a ROS2 bridge republishing it as
-topics, and a safety-stop demo closing the loop (vision → ROS2 → robot
-stop) — all verified live, not just written.
+topics, a safety-stop demo closing the loop (vision → ROS2 → robot
+stop), and MoveIt-backed path checking + obstacle avoidance
+(`check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles`,
+`motion_planner.py`) — all verified live, not just written.
 
 Repo layout:
 - `case1/` — the MCP server (`server.py`), socket backend (`ur_client.py`),
   FK safety check (`kinematics.py`), smoke test (`test_server.py`), opt-in
   sim-then-real shadow wrapper (`shadow_client.py`, `UR_REAL_HOST` env var —
-  see its README section).
+  see its README section), MoveIt-backed path checking + obstacle avoidance
+  (`motion_planner.py` — talks to `move_group`'s planning services directly
+  via rclpy, since `moveit_py` isn't packaged for ROS2 Humble; needs both
+  `ur_robot_driver` and `ur_moveit_config`'s `move_group` launched
+  separately, see Running Things below).
 - `ros2_ur_driver/` — ROS2 backend (`ros2_client.py`), calibration config,
   driver setup notes.
 - `llm_client/` — standalone chat wrapper: `chat.py` (text/voice loop),
@@ -101,7 +108,7 @@ commands, not a blanket override of normal safety judgment.
 
 ## Architecture
 
-`server.py` exposes 27 MCP tools over stdio (8 from the original four
+`server.py` exposes 31 MCP tools over stdio (8 from the original four
 tiers, the rest additive -- queue, waypoints, programs, relative moves,
 vision passthrough, tracking -- see the tool list below). Two interchangeable backends
 behind the same `RobotState` shape (`q_rad`, `qd_rad`, `tcp_pose`,
@@ -138,7 +145,11 @@ sequences, run via the same queue); vision passthrough (`get_vision`/
 REST API over HTTP, `requests` dependency, `VISION_API_URL` env var);
 `track` (deliberately crude 1-DOF demo -- no camera<->robot calibration
 exists, so it only turns the base toward a hand's left/right position in
-frame); `example` (template).
+frame); path checking + obstacle avoidance (`check_path` -- collision-free
+path query, no motion; `add_obstacle`/`remove_obstacle`/`list_obstacles` --
+box obstacles in MoveIt's planning scene; `motion_planner.py`, needs
+`move_group` launched separately, lazy-connects on first call so it
+doesn't block runs that never use it); `example` (template).
 
 `llm_client/chat.py` connects to `server.py` in-process (like
 `test_server.py` — no subprocess/stdio), converts its tools to OpenAI
@@ -252,6 +263,34 @@ local Whisper) and adds spoken replies via `tts.py` (`espeak-ng` →
   both `voice.py` (capture) and `tts.py` (playback) work at all in WSL2.
   Code never hardcodes these names; works on any Linux with a real
   PulseAudio default source/sink too.
+- **`moveit_py` isn't packaged for ROS2 Humble via apt** (only iron/
+  rolling) — `motion_planner.py` talks to `move_group`'s plain ROS2
+  services (`GetMotionPlan`, `GetStateValidity`, `ApplyPlanningScene`,
+  `GetPlanningScene`) directly via rclpy instead. `ros-humble-moveit` +
+  `ros-humble-ur-moveit-config` (apt) were enough — no source build needed.
+- **`ApplyPlanningScene`'s `CollisionObject` normalizes the pose you send**
+  — found live building `list_obstacles`: the pose passed to
+  `add_box_obstacle` comes back as `obj.pose` (the object's own origin) on
+  a later `GetPlanningScene` read, with `obj.primitive_poses[0]` reset to
+  identity (relative to `obj.pose`, not the world). Reading
+  `primitive_poses[0]` for world position (the natural first guess) silently
+  returned `(0, 0, 0)` for every obstacle regardless of where it was placed.
+  Fixed by reading `obj.pose` instead.
+- **PolyScope X (URSim) has no dashboard-server protocol on port 29999** —
+  confirmed again live: connects, then the socket closes with no banner and
+  no reply to any command. Powering the robot on / releasing brakes only
+  works through the browser UI (`http://localhost`), same as `README.md`
+  already said — there's no way to script it from this sandbox.
+- **An un-shut-down `rclpy` node/executor can abort the interpreter on exit
+  even after the actual test has already passed** — reproduced live:
+  `test_server.py` printed `ALL PASSED`, then crashed with `terminate
+  called without an active exception` + a core dump, because
+  `motion_planner.py`'s `MotionPlanner` had no `atexit` cleanup hook (unlike
+  `ros2_client.py`'s `ROS2URClient`, which already had one for the same
+  reason). Fixed by registering `atexit.register(self.disconnect)` at the
+  end of `connect()`, mirroring `ROS2URClient` exactly — same pattern,
+  independently rediscovered. If a new class wraps an `rclpy` node, give it
+  this from the start rather than waiting to hit the crash.
 
 ## Block-diagram cross-check
 
@@ -281,18 +320,28 @@ marked green alongside the tools that *are* done — turned out to be
 optimistic. Built this session (`move_robot_to_position_relative`/
 `move_robot_linear_relative`/`move_robot_linear_sequence`) to close that gap.
 
+**Was blue (not done) when drawn, now done (2026-08-20):** `Path checking`
+and `Obstacle Avoidance` → `check_path`/`add_obstacle`/`remove_obstacle`/
+`list_obstacles` (`motion_planner.py`, MoveIt-backed — real OMPL planning
+against a live planning scene, not a stub). Verified live against the
+simulator: a box obstacle placed in the arm's way makes `check_path` report
+infeasible with the specific colliding links, and feasible again once
+removed (`test_server.py`'s path-checking block).
+
 **Still genuinely not built** (all need a missing dependency this repo
-doesn't have, not just missing wiring): `Robot Digital Twin`, `Path
-checking`, `Obstacle Avoidance`, `Environment Shadow` in the diagram's
-strict sense (would need real motion planning, e.g. MoveIt —
-`get_environment_shadow` is a cache of vision+state, not a 3D map);
+doesn't have, not just missing wiring): `Robot Digital Twin` in the
+diagram's strict sense (a 3D scene view / mirrored sim state -- MoveIt's
+planning scene *is* an internal one now, but there's no visualization or
+external mirroring of it); `Environment Shadow` in the diagram's strict
+sense (`get_environment_shadow` is a cache of vision+state, not a 3D map);
 `ObjectID`/`grab_object`/`place_object`/`give_object` (no object-detection
 model — different teammate's task); real spatial `Safety` (needs
 camera↔robot calibration — `safety_stop_demo.py` only reacts to hand
-*presence*, not real proximity); `program_new`/`program_delete`/
-`program_start`/`program_stop` were blue but ARE now built (named
-waypoint sequences); `track` was blue and is now built but deliberately
-crude (1-DOF, no calibration) — see its docstring.
+*presence*, not real proximity, and obstacles in the new planning scene are
+added manually via `add_obstacle`, not auto-populated from vision yet);
+`program_new`/`program_delete`/`program_start`/`program_stop` were blue but
+ARE now built (named waypoint sequences); `track` was blue and is now built
+but deliberately crude (1-DOF, no calibration) — see its docstring.
 
 ## Shadow mode (sim-then-real), added 2026-08-19
 
@@ -305,7 +354,7 @@ means the sim can act as a genuine safety pre-check. User agreed; built
 
 `ShadowClient` duck-types `URClient`'s surface (`connect`, `get_state`,
 `move_joint`, `move_linear`, `move_waypoints`, `set_gripper`, `free_drive`,
-`stop`) so none of `server.py`'s 27 tools needed to change — only the
+`stop`) so none of `server.py`'s 31 tools needed to change — only the
 backend-selection block did (`UR_REAL_HOST` env var, socket backend only;
 raises clearly if combined with `UR_BACKEND=ros2`, not supported — one ROS2
 graph talks to one controller). Target-reaching moves run on sim first and
@@ -319,7 +368,7 @@ configured — sim is a pre-flight gate, not what operators are told the
 robot is doing. `free_drive()` skips sim entirely (no target to verify
 against) and goes straight to whichever robot is meant to be hand-guided.
 
-Verified: full default `test_server.py` (27 tools, live simulator, no
+Verified: full default `test_server.py` (31 tools, live simulator, no
 `UR_REAL_HOST`) still passes unchanged after the edit — confirms shadow
 mode is genuinely opt-in with zero behavior change when off. Also wrote
 `case1/test_shadow_client.py`, a network-free unit test against fake
@@ -418,13 +467,25 @@ simulator alone first.
 cd "international-summer-school-robotics-TER-UR/simulation environment" && docker compose up -d
 # Power on + release brakes at http://localhost until RUNNING
 
-# Case 1 server smoke test (all 27 tools, live)
+# Case 1 server smoke test (all 31 tools, live)
 cd case1 && python3 test_server.py                    # socket backend
 UR_BACKEND=ros2 python3 test_server.py                 # ROS2 backend (driver must be launched)
 UR_REAL_HOST=<real-controller-ip> python3 server.py     # shadow mode: sim-verify, then replay on the real robot
 python3 test_shadow_client.py                           # shadow-gating unit test, no network/robot needed
 # Vision-passthrough tools need vision_human_track's API running first (below) --
 # test_server.py skips those specific tests gracefully if it's not reachable.
+# check_path/add_obstacle/remove_obstacle/list_obstacles need move_group running too (below) --
+# same graceful-skip pattern if it's not reachable.
+
+# MoveIt: path checking + obstacle avoidance (needs ur_robot_driver already
+# launched, below -- move_group reads /joint_states from it)
+source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ros2 launch ur_moveit_config ur_moveit.launch.py \
+  ur_type:=ur10 \
+  robot_ip:=127.0.0.1 \
+  kinematics_params_file:="$(pwd)/../ros2_ur_driver/config/ur10_calibration.yaml" \
+  launch_rviz:=false
+python3 case1/motion_planner.py                         # standalone smoke check: path to HOME
 
 # Chat client
 cd llm_client
