@@ -40,6 +40,7 @@ async def main() -> None:
             "move_robot_to_position", "example",
             "get_robot_state", "move_robot_linear", "move_through_waypoints",
             "move_robot_to_position_safe", "set_gripper", "stop_robot",
+            "sync_sim_to_real",
             "move_robot_queued", "get_queue",
             "save_waypoint", "list_waypoints", "delete_waypoint",
             "move_robot_to_waypoint", "free_drive",
@@ -495,6 +496,16 @@ async def main() -> None:
         assert stopped_idle.data["status"] == "stopped"
         assert stopped_idle.data["cancelled_command_ids"] == []
         print("stop_robot (idle): no-op as expected,", stopped_idle.data["joints_deg"])
+
+        # SYNC_SIM_TO_REAL: only meaningful in shadow mode (UR_REAL_HOST set)
+        # -- same skip-gracefully pattern as vision/path-checking above.
+        try:
+            synced = await client.call_tool("sync_sim_to_real", {})
+        except Exception as exc:
+            print(f"shadow mode not active, skipping sync_sim_to_real: "
+                  f"{str(exc).splitlines()[-1].strip()}")
+        else:
+            print("sync_sim_to_real:", synced.data)
 
         await client.call_tool("move_robot_to_position", {})  # park home
     print("ALL PASSED")

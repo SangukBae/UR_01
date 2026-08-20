@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from shadow_client import ShadowClient
+from shadow_client import _SYNC_ACCEL_RAD_S2, _SYNC_SPEED_RAD_S, ShadowClient
 from ur_client import RobotState
 
 
@@ -135,14 +135,48 @@ def main() -> None:
     print("stop() attempts both independently: ok")
 
     # 7. free_drive() goes straight to the real robot (no sim pre-flight --
-    #    it has no target to verify).
+    #    it has no target to verify) -- but the sim IS resynced afterward,
+    #    since hand-guiding just moved the real robot out from under it.
     sim = FakeClient("sim")
     real = FakeClient("real")
     shadow = ShadowClient(sim=sim, real=real)
     shadow.free_drive(5.0)
-    assert sim.calls == [], "sim must not run free_drive when a real robot is configured"
+    assert [c[0] for c in sim.calls] == ["move_joint"], (
+        "sim must not run free_drive itself, only the resync move_joint after"
+    )
+    assert sim.calls == [
+        ("move_joint", (_state("real").q_rad, _SYNC_SPEED_RAD_S, _SYNC_ACCEL_RAD_S2), {})
+    ]
     assert real.calls == [("free_drive", (5.0,), {})]
-    print("free_drive() -> real only: ok")
+    print("free_drive() -> real only, then sim resynced to real: ok")
+
+    # 8. connect() syncs the sim to the real robot's pose up front (so the
+    #    very first verified move already gates on the true starting pose,
+    #    not the sim's own boot pose) -- and sync_sim_to_real() can be
+    #    called again later on demand, with the same effect.
+    sim = FakeClient("sim")
+    real = FakeClient("real")
+    shadow = ShadowClient(sim=sim, real=real)
+    shadow.connect()
+    assert real.calls[0] == ("connect",)
+    assert sim.calls[-1] == (
+        "move_joint", (_state("real").q_rad, _SYNC_SPEED_RAD_S, _SYNC_ACCEL_RAD_S2), {}
+    )
+    sim.calls.clear()
+    result = shadow.sync_sim_to_real()
+    assert sim.calls == [
+        ("move_joint", (_state("real").q_rad, _SYNC_SPEED_RAD_S, _SYNC_ACCEL_RAD_S2), {})
+    ]
+    assert result.tcp_pose[0] == _state("sim").tcp_pose[0]
+    print("connect() syncs sim to real up front, sync_sim_to_real() repeats it: ok")
+
+    # 9. sync_sim_to_real() is a real=None no-op (just reports sim's state).
+    sim = FakeClient("sim")
+    shadow = ShadowClient(sim=sim, real=None)
+    result = shadow.sync_sim_to_real()
+    assert sim.calls == [], "no real robot configured, nothing to sync to"
+    assert result.tcp_pose[0] == _state("sim").tcp_pose[0]
+    print("sync_sim_to_real() with real=None: no-op: ok")
 
     print("\nAll ShadowClient gating tests passed.")
 

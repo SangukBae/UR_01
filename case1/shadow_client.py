@@ -27,12 +27,34 @@ robot is doing. ``free_drive()`` also goes straight to the real robot
 (falling back to sim only if no real robot is configured): it has no target
 to verify against, so running it in sim first would just be a pointless
 wait before the human ever gets to hand-guide the physical arm.
+
+Pose sync: the pre-flight gate above is only meaningful if the simulator's
+CURRENT pose actually matches the real robot's -- otherwise "verified safe
+in sim" describes a swept path (singularities, joint limits, self-collision
+along the way) the real robot, starting somewhere else entirely, will never
+actually take. There's no guarantee the two start aligned: the simulator
+boots at its own home pose regardless of wherever the physical arm happens
+to be sitting (powered on mid-lesson, jogged by hand, left from a previous
+session, etc.). ``connect()`` therefore reads the real robot's actual joint
+angles and drives the simulator to match BEFORE anything is verified --
+never the other way around, since moving the simulator is free and moving
+the real robot without a verified-safe target is exactly what shadow mode
+exists to prevent. ``sync_sim_to_real()`` re-does this on demand, for any
+later point where the two can drift apart again -- most notably after
+``free_drive()``, which moves only the real robot by hand and has no target
+to verify, so the sim is never told where the arm ended up.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from ur_client import RobotState, URClient
+
+# Fast but not instant -- this only ever moves the simulator (never the real
+# robot), so there's no safety reason to go slow, just readability of the
+# resulting demo/log output.
+_SYNC_SPEED_RAD_S = 1.5
+_SYNC_ACCEL_RAD_S2 = 2.0
 
 
 @dataclass
@@ -54,6 +76,28 @@ class ShadowClient:
         self.sim.connect()
         if self.real is not None:
             self.real.connect()
+            self.sync_sim_to_real()
+
+    def sync_sim_to_real(
+        self,
+        speed: float = _SYNC_SPEED_RAD_S,
+        acceleration: float = _SYNC_ACCEL_RAD_S2,
+    ) -> RobotState:
+        """Drive the simulator to the real robot's CURRENT joint angles.
+
+        Call this any time the two may have drifted apart -- most notably
+        after ``free_drive()`` (which only moves the real robot). Never the
+        reverse: the real robot is never moved to match the simulator, since
+        that would be exactly the unverified real-robot motion shadow mode
+        exists to prevent.
+
+        Returns the simulator's resulting state. A no-op (returns the plain
+        sim state) if no real robot is configured.
+        """
+        if self.real is None:
+            return self.sim.get_state()
+        real_q = self.real.get_state().q_rad
+        return self.sim.move_joint(real_q, speed, acceleration)
 
     def get_state(self) -> RobotState:
         return (self.real or self.sim).get_state()
@@ -101,7 +145,13 @@ class ShadowClient:
         return real_state, trace
 
     def free_drive(self, *args, **kwargs) -> RobotState:
-        return (self.real or self.sim).free_drive(*args, **kwargs)
+        state = (self.real or self.sim).free_drive(*args, **kwargs)
+        if self.real is not None:
+            # Hand-guiding only moved the real robot -- resync the simulator
+            # so the next verified move gates on the pose the arm actually
+            # ended up in, not wherever it was before free-drive started.
+            self.sync_sim_to_real()
+        return state
 
     def stop(self, *args, **kwargs) -> RobotState:
         """Best-effort stop on BOTH robots, independently -- never let one

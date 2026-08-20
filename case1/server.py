@@ -1478,6 +1478,40 @@ def stop_robot() -> dict:
     }
 
 
+@mcp.tool
+def sync_sim_to_real() -> dict:
+    """Move the simulator to match the real robot's CURRENT joint angles.
+
+    Shadow mode (UR_REAL_HOST set) only works as a safety pre-check if the
+    simulator's pose actually matches where the physical arm is right now --
+    otherwise a move "verified safe" in sim describes a path the real robot,
+    starting somewhere else, will never actually take. This already runs
+    automatically when the server connects and right after free_drive(); call
+    it manually if the real robot was moved out of band since then (jogged by
+    hand on the teach pendant, moved by another program, etc.) and you want
+    the next verified move to gate on its true current pose.
+
+    Only the simulator moves -- the real robot is never touched by this call.
+
+    Raises:
+        RuntimeError: No real robot is configured (UR_REAL_HOST unset), so
+            there is nothing to sync the simulator to.
+
+    Returns:
+        A dict with the simulator's resulting ``joints_deg``/``tcp_pose``.
+    """
+    # 1-3. No inputs to validate or units to convert; the target is whatever
+    # the real robot's own current joints are, not a value the caller picks.
+    if not _REAL_HOST:
+        raise RuntimeError(
+            "Shadow mode is not active (UR_REAL_HOST is unset) -- there is "
+            "no real robot for the simulator to sync to."
+        )
+    # 4. Execute (only the simulator moves) and report.
+    state = robot.sync_sim_to_real()
+    return _state_summary(state)
+
+
 # =========================================================================== #
 # TEMPLATE TOOL  --  the minimal shape of a tool, doing nothing real. Copy this
 # to start a new one of your own, then follow the four-step pattern above.

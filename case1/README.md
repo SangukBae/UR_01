@@ -11,7 +11,7 @@ backends).
 
 | File | Role |
 |------|------|
-| `server.py` | the MCP server (31 tools): `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `move_robot_queued` + `get_queue` (extra, non-blocking move with reject/queue/override semantics), `save_waypoint`/`list_waypoints`/`delete_waypoint`/`move_robot_to_waypoint`/`free_drive` (extra, named-pose database + hand-guided teaching), `move_robot_to_position_relative`/`move_robot_linear_relative`/`move_robot_linear_sequence` (extra, delta/multi-pose variants), `program_new`/`list_programs`/`program_delete`/`program_start`/`program_stop` (extra, named waypoint sequences), `get_vision`/`get_environment`/`get_environment_shadow` (extra, MCP-level passthrough to `vision_human_track`), `track` (extra, crude 1-DOF demo -- see its docstring), `check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles` (extra, MoveIt-backed path checking + obstacle avoidance, see ./motion_planner.py), `example` (template) |
+| `server.py` | the MCP server (32 tools): `move_robot_to_position` (Bronze), `get_robot_state` + `move_robot_linear` (Silver), `move_through_waypoints` (Gold), `move_robot_to_position_safe` + `set_gripper` (Diamond), `stop_robot` (extra, team requirement), `move_robot_queued` + `get_queue` (extra, non-blocking move with reject/queue/override semantics), `save_waypoint`/`list_waypoints`/`delete_waypoint`/`move_robot_to_waypoint`/`free_drive` (extra, named-pose database + hand-guided teaching), `move_robot_to_position_relative`/`move_robot_linear_relative`/`move_robot_linear_sequence` (extra, delta/multi-pose variants), `program_new`/`list_programs`/`program_delete`/`program_start`/`program_stop` (extra, named waypoint sequences), `get_vision`/`get_environment`/`get_environment_shadow` (extra, MCP-level passthrough to `vision_human_track`), `track` (extra, crude 1-DOF demo -- see its docstring), `check_path`/`add_obstacle`/`remove_obstacle`/`list_obstacles` (extra, MoveIt-backed path checking + obstacle avoidance, see ./motion_planner.py), `sync_sim_to_real` (extra, shadow-mode only -- re-align the simulator to the real robot's current pose on demand, see "Shadow mode" below), `example` (template) |
 | `queue_manager.py` | background-thread command queue backing `move_robot_queued`/`get_queue`/`program_start` -- the non-blocking layer that makes `stop_robot` able to genuinely interrupt a move within one chat turn |
 | `waypoint_store.py` | plain JSON-file-backed waypoint database (`waypoints.json`, gitignored -- local/runtime data) backing the waypoint tools |
 | `program_store.py` | plain JSON-file-backed program database (`programs.json`, gitignored) -- named ordered lists of waypoint names, backing the program tools |
@@ -47,14 +47,33 @@ and immediately, never gated behind the other's result. `get_robot_state`
 `free_drive` skips the simulator (no target to verify) and goes straight to
 whichever robot is meant to be hand-guided.
 
+**Pose sync.** The simulator boots at its own home pose regardless of
+wherever the physical arm actually is (powered on mid-lesson, jogged by
+hand, left over from a previous session) -- so on its own, "verified safe
+in sim" would describe a swept path the real robot, starting somewhere
+else, would never actually take. To fix that, `connect()` reads the real
+robot's current joint angles and drives the simulator to match BEFORE
+anything is verified -- never the other way; only the simulator ever moves
+for this, the real robot is untouched. This re-runs automatically right
+after `free_drive` too (hand-guiding only moves the real robot, so the sim
+would otherwise be left out of sync the moment free-drive ends). Call the
+`sync_sim_to_real` tool yourself for any other point where the two might
+have drifted apart -- e.g. the real robot was jogged from the teach pendant
+mid-session.
+
 Not enabled by default -- with `UR_REAL_HOST` unset, `robot` is a plain
-`URClient` exactly as before this existed. Not tested against a physical
-robot yet (none is reachable from this sandbox); `test_shadow_client.py`
-exercises the gating logic itself (call order, propagate-vs-swallow,
-`get_state`/`stop` routing) against fake stand-in clients, no network
-needed. Before pointing this at a real arm: confirm the workspace is clear,
-someone has hands on (or near) the physical e-stop, and the target poses
-have already been exercised safely on the simulator alone.
+`URClient` exactly as before this existed. `test_shadow_client.py`
+exercises the gating and pose-sync logic itself (call order,
+propagate-vs-swallow, `get_state`/`stop` routing, sync-on-connect,
+sync-after-free_drive) against fake stand-in clients, no network needed.
+Verified live against an actual physical UR10 (2026-08-20, `192.168.1.100`
+on this workspace's LAN): `connect()`'s auto-sync moved the simulator to
+the real robot's live joint angles (~[-78, -96, -65, -79, 58, 59] deg, far
+from the sim's own home pose) with <0.01 deg residual error, and the real
+robot's own joints were confirmed unchanged by the sync. Before pointing
+this at a real arm for actual MOTION (not just read/sync): confirm the
+workspace is clear, someone has hands on (or near) the physical e-stop, and
+the target poses have already been exercised safely on the simulator alone.
 
 **Don't mix backends against the same live robot in one session** -- the
 socket backend's raw URScript upload knocks out the ROS2 driver's External
